@@ -1,0 +1,339 @@
+// ------------------------------------------------
+// Code from Tim Davis' CHOLMOD User Guide
+// ------------------------------------------------
+
+#include "cholmod.h"
+#include "amd.h"
+#include "colamd.h"
+#include "mkl_cblas.h"
+#include "mkl_lapack.h"
+
+
+#include <stdio.h>
+#include <iostream>
+#include "Header.h"
+#include <chrono>
+#include <omp.h>
+#include <string>
+
+
+
+using std::cout;
+using std::endl;
+
+FILE* ff;
+
+static void my_handler(int status, const char* file, int line,
+	const char* message)
+{
+	printf("cholmod error: file: %s line: %d status: %d: %s\n",
+		file, line, status, message);
+	if (status < 0)
+	{
+		if (ff != NULL) fclose(ff);
+		exit(1);
+	}
+}
+
+static void check_version(const char* package, int ver[3],
+	int major, int minor, int patch)
+{
+	printf("%s version %d.%d.%d\n", package, ver[0], ver[1], ver[2]);
+#ifndef TEST_COVERAGE
+	if (ver[0] != major || ver[1] != minor || ver[2] != patch)
+	{
+		printf("header version differs (%d,%d,%d) from library\n",
+			major, minor, patch);
+		my_handler(CHOLMOD_INVALID, __FILE__, __LINE__,
+			"version mismatch");
+	}
+#endif
+}
+
+
+int main(void)
+{
+
+	omp_set_num_threads(12);
+	cholmod_sparse* A;
+	cholmod_dense* x, * b, * r;
+	cholmod_factor* L;
+	double one[2] = { 1,0 }, m1[2] = { -1,0 }; /* basic scalars */
+	cholmod_common c;
+	cholmod_start(&c); /* start CHOLMOD */
+	cout << "gpu: " << c.useGPU << endl;
+	c.nthreads_max = 12;
+	cout << "nthreads: " << c.nthreads_max << endl;
+
+
+
+	int dtype = CHOLMOD_DOUBLE;
+	c.print = 5;
+	//double metis_memory = 2;
+	c.useGPU = 0;
+
+	double Rmetal = 1;
+	double Rins = 1000;
+	const int X = 5; //number of columns, number sites in X direction
+	const int Y = 7; //number of rows, number of sites in Y direction
+
+	double* Tgrid = new double[X * Y]();
+	Tgridset(Tgrid, X, Y);
+	double* Rgrid = new double[X * Y]();
+	Rgridset(Rgrid, X, Y, Rins);
+
+	int nnz2 = (1 + 2 + 3 * (Y - 1)) + ((Y + 1) + 2 + 3 * (Y - 1)) + (((Y - 1) * 3) + 2) * (X - 2) - (Y + 1);//(1+(Y-2)*3+2)+((X-1)*((Y - 1) * 3+2))-(Y-2);
+	cout << "nnz: " << nnz2 << endl;
+
+	double* Gvals = new double[nnz2]();
+	int* Rowlind = new int[nnz2]();
+	int* Colcoords = new int[nnz2]();
+
+	constructRowlind(Rowlind, nnz2, X, Y);
+	constructColind(Colcoords, nnz2, X, Y);
+
+	fillgvalsfirstrow(Gvals, Rgrid, X, Y);
+	std::chrono::steady_clock::time_point begin1 = std::chrono::steady_clock::now();
+	fillgvalsmid(Gvals, Rgrid, X, Y, nnz2);
+	std::chrono::steady_clock::time_point end1 = std::chrono::steady_clock::now();
+	std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
+	fillgvalslastrow(Gvals, Rgrid, X, Y, nnz2);
+	fillgvalsfirselement(Gvals, Rgrid, X, Y);
+
+	if ((X * Y + 1) < 100) {
+		printrowsfloat(Gvals, nnz2);
+	}
+	cout << endl << endl << "end of Gvals" << endl;
+
+	//printrows(Colcoords,nnz2);
+	cout << endl << endl << "end of cols" << endl;
+
+	//printrows(Rowlind, nnz2);
+	cout << endl << endl << "end of rows" << endl;
+
+
+	//float* h_dense = new float[(X * Y + 2) * (X * Y + 2)];
+	//printArray(h_dense, (X * Y + 2));
+	//cout << endl << endl << "end of h" << endl;
+
+	float temp = 300;
+
+	Tgridupdater(Tgrid, X, Y, temp);
+
+	bool skipfornow = 0;
+	if (skipfornow != 0) {
+
+	int nnz = nnz2;
+	size_t nnzsizet = nnz2;
+	size_t sizer = (X * Y + 1);
+
+	cholmod_triplet* T = cholmod_allocate_triplet(sizer, sizer, nnzsizet, 1, CHOLMOD_REAL, &c);
+	std::cout << "T nnz check:" << T->nnz << std::endl;
+
+	int* triplet_i = (int*)(T->i);
+	int* triplet_j = (int*)(T->j);
+	double* triplet_x = (double*)(T->x);
+	for (int ne = 0; ne < nnz2; ne++)
+	{
+		triplet_i[T->nnz] = Rowlind[ne];
+		triplet_j[T->nnz] = Colcoords[ne];
+		triplet_x[T->nnz] = Gvals[ne];
+		T->nnz++;
+	}
+
+	A = cholmod_triplet_to_sparse(T, nnzsizet, &c);
+	if ((X * Y + 1) < 100) {
+		cholmod_print_sparse(A, "A", &c); /* print the matrix */
+	}
+
+	//cholmod_dense* BB=cholmod_sparse_to_dense(A, &c);
+
+	//cholmod_print_dense(BB, "BB", &c);
+
+	A->stype = 1;
+
+	std::cout << "check val" << ((double*)A->x)[0] << std::endl;
+
+	if (A == NULL || A->stype == 0) /* A must be symmetric */
+	{
+		cholmod_free_sparse(&A, &c);
+		cholmod_finish(&c);
+		return (0);
+	}
+
+	b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c); /* b = ones(n,1) */
+	((double*)b->x)[0] = 1;
+
+	std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+	c.final_monotonic = false;
+	c.supernodal = CHOLMOD_SIMPLICIAL;
+	c.nmethods = 1;
+	c.method[0].ordering = CHOLMOD_AMD;
+	c.postorder = false;
+	//c.final_resymbol = false;
+	L = cholmod_analyze(A, &c); /* analyze */
+	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+	std::cout << "Analyze A time = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[micros]" << std::endl;
+
+
+	std::cout << "here1 = " << A->stype << endl;
+	if ((X * Y + 1) < 100) {
+		cholmod_print_factor(L, "L", &c);
+	}
+
+	std::cout << "here2 = " << A->stype << endl;
+
+	std::cout << "here3 = " << endl;
+
+	//cholmod_sparse* bset = cholmod_allocate_sparse(1, 1, 1, 0, 1, 0, CHOLMOD_PATTERN + dtype, &c);
+
+
+	float tempstart = 305;
+	float tempfinal = 365;
+	float tempstep = 30;
+
+	
+
+	for (float temp = tempstart; temp <= tempfinal; temp = temp + tempstep) {
+		std::cout << "T:" << temp << std::endl;
+
+		b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c); /* b = ones(n,1) */
+		((double*)b->x)[0] = 1;
+
+		std::chrono::steady_clock::time_point begin1 = std::chrono::steady_clock::now();
+		for (int i = 0; i < X * Y; i++) {
+			if (Tgrid[i] <= temp) {
+				Rgrid[i] = Rmetal;
+			}
+		}
+		//printrowsfloat(Rgrid, X*Y);
+
+		fillgvalsfirstrow(Gvals, Rgrid, X, Y);
+		fillgvalsmid(Gvals, Rgrid, X, Y, nnz2);
+		fillgvalslastrow(Gvals, Rgrid, X, Y, nnz2);
+		fillgvalsfirselement(Gvals, Rgrid, X, Y);
+		std::chrono::steady_clock::time_point end1 = std::chrono::steady_clock::now();
+		std::cout << "Update G time = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
+
+		//std::cout << "check val: " << ((double*)A->x)[0] << std::endl;
+		//L = cholmod_analyze(A, &c); /* analyze */
+		//cholmod_print_sparse(A, "A", &c); /* print the matrix */
+
+		std::chrono::steady_clock::time_point begin2 = std::chrono::steady_clock::now();
+		cholmod_factorize(A, L, &c); /* factorize */
+
+		//std::cout << "factor element = " << ((double*)L->x)[0] << std::endl;
+
+		//std::cout << "L nnz = " << L->nzmax << std::endl;
+
+
+		//std::cout << "chol print = " << cholmod_print_perm << std::endl;
+
+
+		//int nzed = ((int*))L->nz
+		//for (int ne = 0; ne < 173; ne++)
+		//{
+		//	std::cout << "factor element = " << ne << " , " << ((double*)L->i)[ne] << " , " << ((double*)L->x)[ne] << std::endl;
+		//}
+
+
+		std::chrono::steady_clock::time_point end2 = std::chrono::steady_clock::now();
+		std::cout << "Refactor time = " << std::chrono::duration_cast<std::chrono::microseconds>(end2 - begin2).count() << "[micros]" << std::endl;
+		std::chrono::steady_clock::time_point begin3 = std::chrono::steady_clock::now();
+		//x = cholmod_solve(CHOLMOD_A, L, b, &c); /* solve Ax=b */
+		std::chrono::steady_clock::time_point end3 = std::chrono::steady_clock::now();
+		std::cout << "Solve time = " << std::chrono::duration_cast<std::chrono::microseconds>(end3 - begin3).count() << "[micros]" << std::endl;
+		// solve with reused workspace
+		//cholmod_dense* Ywork = NULL, * Ework = NULL;
+		//cholmod_sparse* xset = NULL;
+		//cholmod_dense* x2 = NULL;
+		//cholmod_free_dense(&x, &c);
+
+		cholmod_dense* Ywork = NULL, * Ework = NULL;
+		//cholmod_free_dense(&X, cm);
+		int xtype = A->xtype;  // real, complex, or zomplex
+		int dtype = A->dtype;
+		int xdtype = xtype + dtype;
+		//B = cholmod_zeros(A->nrow, 1, xdtype, &c);
+
+		cholmod_sparse* bset = cholmod_dense_to_sparse(b, 1, &c);
+		cholmod_sparse* Xset = NULL;
+
+		std::chrono::steady_clock::time_point begin4 = std::chrono::steady_clock::now();
+		//Bx[0] = 1 + trial / xn;       // tweak B each iteration
+		cholmod_dense* x = NULL;
+		cholmod_solve2(CHOLMOD_A, L, b, bset, &x, &Xset, &Ywork, &Ework, &c);
+
+		std::chrono::steady_clock::time_point end4 = std::chrono::steady_clock::now();
+		std::cout << "fastSolve time = " << std::chrono::duration_cast<std::chrono::microseconds>(end4 - begin4).count() << "[micros]" << std::endl;
+
+		std::chrono::steady_clock::time_point begin5 = std::chrono::steady_clock::now();
+		double beta[2];
+		beta[0] = 0;
+		beta[1] = 0;
+		cholmod_factorize_p(A, beta, NULL, 0, L, &c);
+		std::chrono::steady_clock::time_point end5 = std::chrono::steady_clock::now();
+		std::cout << "factorp time = " << std::chrono::duration_cast<std::chrono::microseconds>(end5 - begin5).count() << "[micros]" << std::endl;
+
+		//cholmod_free_dense(&Ywork, &c);
+		//cholmod_free_dense(&Ework, &c);
+		r = cholmod_copy_dense(b, &c); /* r = b */
+		//double *x2x;
+		//x2x = ((double*)x->x);
+		std::cout << "out1:" << " " << ((double*)x->x)[0] << std::endl;
+		//std::cout << "out1prime:" << " " << ((double*)Xset->x)[0] << std::endl;
+
+		cholmod_free_dense(&Ywork, &c);
+		cholmod_free_dense(&Ework, &c);
+		//cholmod_free_dense(&x, &c);
+		cholmod_free_dense(&b, &c);
+		cholmod_free_sparse(&Xset, &c);
+		cholmod_free_sparse(&bset, &c);
+
+
+		//if ((X * Y + 1)<100) {
+		//for (int ne = 0; ne < (X * Y + 1); ne++)
+		//{
+		//	std::cout << "out2:" << " " << ((double*)x->x)[ne] << std::endl;
+		//}
+		//	}
+
+		cholmod_sdmult(A, 0, m1, one, x, r, &c); /* r = r-Ax */
+		printf("norm(b-Ax) %8.1e\n", cholmod_norm_dense(r, 0, &c)); /* print norm(r) */
+		std::cout << "rcond:" << cholmod_rcond(L, &c) << std::endl;
+
+		if ((X * Y + 1) < 100) {
+			cholmod_print_factor(L, "L", &c);
+			cholmod_print_dense(x, "x", &c);
+			cholmod_print_common("c", &c);
+		}
+
+
+	}
+
+}
+	int aa = SUITESPARSE_OPENMP_MAX_THREADS;
+	std::cout << "OPENMP?: " << aa << endl;
+	std::cout << "OPENMP2?: " << CHOLMOD_QUERY_HAS_OPENMP << endl;
+	std::cout << "CUDA?: " << CHOLMOD_QUERY_HAS_CUDA << endl;
+	std::cout << "gpustats:" << cholmod_gpu_stats(&c) << endl;
+
+	cholmod_free_factor(&L, &c); /* free matrices */
+	cholmod_free_sparse(&A, &c);
+	cholmod_free_dense(&r, &c);
+	cholmod_free_dense(&x, &c);
+	cholmod_free_dense(&b, &c);
+	//cholmod_print_common("common", &c);
+	//cholmod_gpu_stats(&c);
+	cholmod_finish(&c); /* finish CHOLMOD */
+	std::cout << sizeof(int) << std::endl;
+	std::cout << c.blas_ok << std::endl;
+
+
+
+
+
+
+	return (0);
+}
