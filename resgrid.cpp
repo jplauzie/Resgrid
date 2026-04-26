@@ -19,6 +19,7 @@
 
 
 
+
 using std::cout;
 using std::endl;
 
@@ -79,8 +80,8 @@ int main(void)
 
 	double Rmetal = 1;
 	double Rins = 1000;
-	const int X = 1000; //number of columns, number sites in X direction
-	const int Y = 1000; //number of rows, number of sites in Y direction
+	const int X = 2000; //number of columns, number sites in X direction
+	const int Y = 2000; //number of rows, number of sites in Y direction
 
 	double* Tgrid = new double[X * Y]();
 	Tgridset(Tgrid, X, Y);
@@ -117,10 +118,6 @@ int main(void)
 	cout << endl << endl << "end of rows" << endl;
 
 
-	//float* h_dense = new float[(X * Y + 2) * (X * Y + 2)];
-	//printArray(h_dense, (X * Y + 2));
-	//cout << endl << endl << "end of h" << endl;
-
 	float temp = 300;
 
 	Tgridupdater(Tgrid, X, Y, temp);
@@ -151,11 +148,7 @@ int main(void)
 		cholmod_print_sparse(A, "A", &c); /* print the matrix */
 	}
 
-	//cholmod_dense* BB=cholmod_sparse_to_dense(A, &c);
-
-	//cholmod_print_dense(BB, "BB", &c);
-
-	A->stype = 1;
+	A->stype = -1; // lower triangular; required for supernodal cholmod_solve
 
 	std::cout << "check val" << ((double*)A->x)[0] << std::endl;
 
@@ -166,17 +159,57 @@ int main(void)
 		return (0);
 	}
 
-	b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c); /* b = ones(n,1) */
+	// Build a one-time mapping from Gvals index -> A->x index.
+	// After cholmod_triplet_to_sparse the values in A->x are in CSC
+	// (column-sorted) order, which is NOT the same order as Gvals /
+	// Rowlind / Colcoords.  We walk the CSC structure once here to
+	// record, for each Gvals entry k, which slot in A->x holds that
+	// (row, col) pair.  In the temperature loop we then scatter values
+	// with: A->x[gvals_to_Ax[k]] = Gvals[k]  -- no triplet rebuild,
+	// no free/realloc of A, and L's symbolic factor stays valid.
+	int* Ap = (int*)(A->p);   // column pointers (size ncol+1)
+	int* Ai = (int*)(A->i);   // row indices      (size nnz)
+	int* gvals_to_Ax = new int[nnz2];
+	for (int k = 0; k < nnz2; k++)
+	{
+		int row = Rowlind[k];
+		int col = Colcoords[k];
+		bool found = false;
+		for (int p = Ap[col]; p < Ap[col + 1]; p++)
+		{
+			if (Ai[p] == row)
+			{
+				gvals_to_Ax[k] = p;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			printf("ERROR: mapping not found for Gvals[%d] (row=%d col=%d)\n", k, row, col);
+			exit(1);
+		}
+	}
+	std::cout << "Gvals->A->x mapping built." << std::endl;
+
+	b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c);
 	((double*)b->x)[0] = 1;
 
 	std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
-	c.final_monotonic = false;
 	c.supernodal = CHOLMOD_SUPERNODAL;
+	c.supernodal_switch = 0; // always use supernodal regardless of flops/nnz ratio
+
 	c.nmethods = 1;
 	c.method[0].ordering = CHOLMOD_AMD;
-	c.postorder = false;
-	//c.final_resymbol = false;
+
+	// Lower the pivot acceptance threshold. The default dbound causes
+	// CHOLMOD to abandon supernodal Cholesky and fall back to simplicial
+	// LDL when it encounters small pivots (which occur here because the
+	// resistance ratio Rins/Rmetal = 1000 makes the matrix ill-conditioned
+	// as cells switch state). Setting dbound to 0 tells CHOLMOD to accept
+	// any positive pivot and stay in supernodal mode.
+	c.dbound = 0.0;
 	L = cholmod_analyze(A, &c); /* analyze */
 	std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 	std::cout << "Analyze A time = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[micros]" << std::endl;
@@ -188,22 +221,24 @@ int main(void)
 	}
 
 	std::cout << "here2 = " << A->stype << endl;
-
-	std::cout << "here3 = " << endl;
-
-	//cholmod_sparse* bset = cholmod_allocate_sparse(1, 1, 1, 0, 1, 0, CHOLMOD_PATTERN + dtype, &c);
-
+	
 
 	float tempstart = 305;
 	float tempfinal = 365;
 	float tempstep = 30;
 
-	
+	// Ywork/Ework retained for potential future use but not needed by cholmod_solve.
+	cholmod_dense* Ywork = NULL, * Ework = NULL;
+	cholmod_dense* x = NULL;
+
+	// bset/Xset were used by cholmod_solve2 but are not needed by cholmod_solve.
+	cholmod_sparse* bset = NULL;
 
 	for (float temp = tempstart; temp <= tempfinal; temp = temp + tempstep) {
 		std::cout << "T:" << temp << std::endl;
 
-		b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c); /* b = ones(n,1) */
+		// Rebuild b (it is freed at the end of each iteration below)
+		b = cholmod_zeros(A->nrow, 1, A->xtype + dtype, &c);
 		((double*)b->x)[0] = 1;
 
 		std::chrono::steady_clock::time_point begin1 = std::chrono::steady_clock::now();
@@ -212,130 +247,105 @@ int main(void)
 				Rgrid[i] = Rmetal;
 			}
 		}
-		//printrowsfloat(Rgrid, X*Y);
 
 		fillgvalsfirstrow(Gvals, Rgrid, X, Y);
 		fillgvalsmid(Gvals, Rgrid, X, Y, nnz2);
 		fillgvalslastrow(Gvals, Rgrid, X, Y, nnz2);
 		fillgvalsfirselement(Gvals, Rgrid, X, Y);
+
+		// FIX 3: Scatter updated values directly into A->x using the
+		//         pre-built mapping.  A is never freed so L's symbolic
+		//         factor remains valid across iterations.
+		double* Ax = (double*)(A->x);
+		for (int k = 0; k < nnz2; k++)
+			Ax[gvals_to_Ax[k]] = Gvals[k];
+
 		std::chrono::steady_clock::time_point end1 = std::chrono::steady_clock::now();
 		std::cout << "Update G time = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
 
-		//std::cout << "check val: " << ((double*)A->x)[0] << std::endl;
-		//L = cholmod_analyze(A, &c); /* analyze */
-		//cholmod_print_sparse(A, "A", &c); /* print the matrix */
-
 		std::chrono::steady_clock::time_point begin2 = std::chrono::steady_clock::now();
-		cholmod_factorize(A, L, &c); /* factorize */
 
-		//std::cout << "factor element = " << ((double*)L->x)[0] << std::endl;
+		// If CHOLMOD fell back to simplicial on the previous iteration,
+		// re-analyze to get a fresh supernodal symbolic factor.
+		if (!L->is_super)
+		{
+			std::cout << "NOTE: re-analyzing (L was simplicial)" << std::endl;
+			cholmod_free_factor(&L, &c);
+			L = cholmod_analyze(A, &c);
+		}
 
-		//std::cout << "L nnz = " << L->nzmax << std::endl;
+		// Print L state before factorizing so we can see what
+		// cholmod_factorize_p is working with each iteration.
+		std::cout << "pre-factor: L->is_super=" << L->is_super
+		          << " L->is_ll=" << L->is_ll
+		          << " L->minor=" << L->minor << std::endl;
 
-
-		//std::cout << "chol print = " << cholmod_print_perm << std::endl;
-
-
-		//int nzed = ((int*))L->nz
-		//for (int ne = 0; ne < 173; ne++)
-		//{
-		//	std::cout << "factor element = " << ne << " , " << ((double*)L->i)[ne] << " , " << ((double*)L->x)[ne] << std::endl;
-		//}
-
+		double beta[2] = { 0, 0 };
+		// final_ll=1 keeps L in LL' form after factorization.
+		// Without this CHOLMOD converts to LDL' on completion, and
+		// on the next call sees a non-LL' supernodal factor which
+		// triggers a simplicial restart.
+		c.final_ll = 1;
+		cholmod_factorize_p(A, beta, NULL, 0, L, &c);
 
 		std::chrono::steady_clock::time_point end2 = std::chrono::steady_clock::now();
 		std::cout << "Refactor time = " << std::chrono::duration_cast<std::chrono::microseconds>(end2 - begin2).count() << "[micros]" << std::endl;
-		std::chrono::steady_clock::time_point begin3 = std::chrono::steady_clock::now();
-		//x = cholmod_solve(CHOLMOD_A, L, b, &c); /* solve Ax=b */
-		std::chrono::steady_clock::time_point end3 = std::chrono::steady_clock::now();
-		std::cout << "Solve time = " << std::chrono::duration_cast<std::chrono::microseconds>(end3 - begin3).count() << "[micros]" << std::endl;
-		// solve with reused workspace
-		//cholmod_dense* Ywork = NULL, * Ework = NULL;
-		//cholmod_sparse* xset = NULL;
-		//cholmod_dense* x2 = NULL;
-		//cholmod_free_dense(&x, &c);
-
-		cholmod_dense* Ywork = NULL, * Ework = NULL;
-		//cholmod_free_dense(&X, cm);
-		int xtype = A->xtype;  // real, complex, or zomplex
-		int dtype = A->dtype;
-		int xdtype = xtype + dtype;
-		//B = cholmod_zeros(A->nrow, 1, xdtype, &c);
-
-		cholmod_sparse* bset = cholmod_dense_to_sparse(b, 1, &c);
-		cholmod_sparse* Xset = NULL;
+		std::cout << "post-factor: L->is_super=" << L->is_super
+		          << " L->is_ll=" << L->is_ll
+		          << " L->minor=" << L->minor << std::endl;
 
 		std::chrono::steady_clock::time_point begin4 = std::chrono::steady_clock::now();
-		//Bx[0] = 1 + trial / xn;       // tweak B each iteration
-		cholmod_dense* x = NULL;
-		cholmod_solve2(CHOLMOD_A, L, b, bset, &x, &Xset, &Ywork, &Ework, &c);
+
+		// Use cholmod_solve instead of cholmod_solve2. cholmod_solve2
+		// converts L from supernodal to simplicial internally and does
+		// not restore it, causing every subsequent cholmod_factorize_p
+		// to run in slow simplicial mode. cholmod_solve does not modify
+		// L's storage type, so the supernodal structure is preserved for
+		// the next factorization. The workspace (Ywork/Ework) is managed
+		// separately and freed after the loop.
+		if (x != NULL) cholmod_free_dense(&x, &c);
+		x = cholmod_solve(CHOLMOD_A, L, b, &c);
 
 		std::chrono::steady_clock::time_point end4 = std::chrono::steady_clock::now();
 		std::cout << "fastSolve time = " << std::chrono::duration_cast<std::chrono::microseconds>(end4 - begin4).count() << "[micros]" << std::endl;
 
-		std::chrono::steady_clock::time_point begin5 = std::chrono::steady_clock::now();
-		double beta[2];
-		beta[0] = 0;
-		beta[1] = 0;
-		cholmod_factorize_p(A, beta, NULL, 0, L, &c);
-		std::chrono::steady_clock::time_point end5 = std::chrono::steady_clock::now();
-		std::cout << "factorp time = " << std::chrono::duration_cast<std::chrono::microseconds>(end5 - begin5).count() << "[micros]" << std::endl;
-
-		//cholmod_free_dense(&Ywork, &c);
-		//cholmod_free_dense(&Ework, &c);
-		r = cholmod_copy_dense(b, &c); /* r = b */
-		//double *x2x;
-		//x2x = ((double*)x->x);
 		std::cout << "out1:" << " " << ((double*)x->x)[0] << std::endl;
-		//std::cout << "out1prime:" << " " << ((double*)Xset->x)[0] << std::endl;
 
-		cholmod_free_dense(&Ywork, &c);
-		cholmod_free_dense(&Ework, &c);
-		//cholmod_free_dense(&x, &c);
-		cholmod_free_dense(&b, &c);
-		cholmod_free_sparse(&Xset, &c);
-		cholmod_free_sparse(&bset, &c);
+		// Copy b into r BEFORE freeing b, then free b
+		r = cholmod_copy_dense(b, &c);          /* r = b */
+		cholmod_free_dense(&b, &c);             /* safe to free b now */
 
-
-		//if ((X * Y + 1)<100) {
-		//for (int ne = 0; ne < (X * Y + 1); ne++)
-		//{
-		//	std::cout << "out2:" << " " << ((double*)x->x)[ne] << std::endl;
-		//}
-		//	}
-
-		cholmod_sdmult(A, 0, m1, one, x, r, &c); /* r = r-Ax */
+		// Residual check: both r and x are valid here
+		cholmod_sdmult(A, 0, m1, one, x, r, &c); /* r = r - Ax */
 		printf("norm(b-Ax) %8.1e\n", cholmod_norm_dense(r, 0, &c)); /* print norm(r) */
 		std::cout << "rcond:" << cholmod_rcond(L, &c) << std::endl;
+
+		// Free r after it has been used
+		cholmod_free_dense(&r, &c);
 
 		if ((X * Y + 1) < 100) {
 			cholmod_print_factor(L, "L", &c);
 			cholmod_print_dense(x, "x", &c);
 			cholmod_print_common("c", &c);
 		}
-
-
 	}
 
-}
+	// Free persistent solve workspace after the loop
+	cholmod_free_dense(&Ywork, &c);
+	cholmod_free_dense(&Ework, &c);
+	cholmod_free_dense(&x, &c);
+	delete[] gvals_to_Ax;
+
+	} // end skipfornow
+
 	std::cout << "MKL max threads: " << mkl_get_max_threads() << std::endl;
 	std::cout << "MKL BLAS domain: " << mkl_domain_get_max_threads(MKL_DOMAIN_BLAS) << std::endl;
 
 	cholmod_free_factor(&L, &c); /* free matrices */
 	cholmod_free_sparse(&A, &c);
-	cholmod_free_dense(&r, &c);
-	cholmod_free_dense(&x, &c);
-	cholmod_free_dense(&b, &c);
-	//cholmod_print_common("common", &c);
-	//cholmod_gpu_stats(&c);
 	cholmod_finish(&c); /* finish CHOLMOD */
 	std::cout << sizeof(int) << std::endl;
 	std::cout << c.blas_ok << std::endl;
-
-
-
-
-
 
 	return (0);
 }
