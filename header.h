@@ -3,484 +3,358 @@
 #include <iostream>
 #include <iomanip>
 #include <omp.h>
+#include <random>
 
 using std::cout;
 using std::endl;
 using std::setw;
 using std::fixed;
-//std::cout << std::setprecision(2) << std::fixed;
 
-#define CHECK_CUDA(func)                                                       \
-{                                                                              \
-    cudaError_t status = (func);                                               \
-    if (status != cudaSuccess) {                                               \
-        printf("CUDA API failed at line %d with error: %s (%d)\n",             \
-               __LINE__, cudaGetErrorString(status), status);                  \
-        return EXIT_FAILURE;                                                   \
-    }                                                                          \
+// ============================================================================
+// Circuit topology
+// ============================================================================
+// Node 0       : source bus bar (V=1). Connected to every first-row grid node
+//                via 2/R off-diagonal entries (both row and column).
+// Nodes 1..X*Y : grid nodes, node_idx(i,j) = 1 + i*Y + j.
+// Eliminated   : sink bus bar (V=0). Its 2/R conductances to last-row nodes
+//                contribute ONLY to those nodes' diagonals — there is no
+//                off-diagonal column for it in the matrix.
+//
+// Result: the matrix is strictly SPD (not singular), suitable for Cholesky.
+// RHS b[0]=1 sets the source voltage; all other b entries are 0.
+// ============================================================================
+
+#define CHECK_CUDA(func)                                                        \
+{                                                                               \
+    cudaError_t status = (func);                                                \
+    if (status != cudaSuccess) {                                                \
+        printf("CUDA API failed at line %d with error: %s (%d)\n",              \
+               __LINE__, cudaGetErrorString(status), status);                   \
+        return EXIT_FAILURE;                                                    \
+    }                                                                           \
 }
 
-#define CHECK_CUSPARSE(func)                                                   \
-{                                                                              \
-    cusparseStatus_t status = (func);                                          \
-    if (status != CUSPARSE_STATUS_SUCCESS) {                                   \
-        printf("CUSPARSE API failed at line %d with error: %s (%d)\n",         \
-               __LINE__, cusparseGetErrorString(status), status);              \
-        return EXIT_FAILURE;                                                   \
-    }                                                                          \
+#define CHECK_CUSPARSE(func)                                                    \
+{                                                                               \
+    cusparseStatus_t status = (func);                                           \
+    if (status != CUSPARSE_STATUS_SUCCESS) {                                    \
+        printf("CUSPARSE API failed at line %d with error: %s (%d)\n",          \
+               __LINE__, cusparseGetErrorString(status), status);               \
+        return EXIT_FAILURE;                                                    \
+    }                                                                           \
 }
 
-//#define CHECK_CUSOLVER(func)                                                   \
-//{                                                                              \
-//    cusolverStatus_t status = (func);                                          \
-//    if (status != CUSOLVER_STATUS_SUCCESS) {                                   \
-//        printf("CUSOLVER API failed at line %d with error: %s (%d)\n",         \
-//               __LINE__, cusolverGetErrorString(status), status);              \
-//        return EXIT_FAILURE;                                                   \
-//    }                                                                          \
-//}
-
-#define CUSOLVER_CHECK(err)                                                                        \
-    do {                                                                                           \
-        cusolverStatus_t err_ = (err);                                                             \
-        if (err_ != CUSOLVER_STATUS_SUCCESS) {                                                     \
-            printf("cusolver error %d at %s:%d\n", err_, __FILE__, __LINE__);                      \
-            throw std::runtime_error("cusolver error");                                            \
-        }                                                                                          \
+#define CUSOLVER_CHECK(err)                                                     \
+    do {                                                                        \
+        cusolverStatus_t err_ = (err);                                          \
+        if (err_ != CUSOLVER_STATUS_SUCCESS) {                                  \
+            printf("cusolver error %d at %s:%d\n", err_, __FILE__, __LINE__);   \
+            throw std::runtime_error("cusolver error");                         \
+        }                                                                       \
     } while (0)
 
 
 void printArray(double A[], int N) {
-	for (int i = 0; i < N; i++) {
-		for (int j = 0; j < N; j++) {
-			cout << setw(5) << std::fixed << std::setprecision(3) << A[i * N + j] << " ";
-		}
-		cout << endl;
-	}
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++)
+            cout << setw(5) << std::fixed << std::setprecision(3) << A[i*N+j] << " ";
+        cout << endl;
+    }
 }
-
 void printrows(int A[], int N) {
-	for (int i = 0; i < N; i++) {
-		cout << A[i] << " ";
-	}
+    for (int i = 0; i < N; i++) cout << A[i] << " ";
 }
-
 void printrowsfloat(double A[], int N) {
-	for (int i = 0; i < N; i++) {
-		cout << A[i] << " ";
-	}
+    for (int i = 0; i < N; i++) cout << A[i] << " ";
 }
-
-
 void printGArray(double A[], int N) {
-	for (int i = 0; i < N; i++) {
-		for (int j = 0; j < N; j++) {
-			cout << A[i * N + j] << " ";
-		}
-	}
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            cout << A[i*N+j] << " ";
 }
 
-void Tgridset(double Tgrid[], int X, int Y) {
-	for (int i = 0; i < X; i++) {
-		for (int j = 0; j < Y; j++) {
-			Tgrid[i * Y + j] = 345;//rand()%100;
-		}
-	}
-	return;
-}
-
-void Rgridset(double Rgrid[], int X, int Y, double Rins) {
-	for (int i = 0; i < X; i++) {
-		for (int j = 0; j < Y; j++) {
-			Rgrid[i * Y + j] = Rins;
-		}
-	}
-	return;
-}
-
-void Rgridupdater(double Rgrid[], double Tgrid[], int X, int Y, int T, double Rmetal) {
-	for (int i = 0; i < X; i++) {
-		for (int j = 0; j < Y; j++) {
-			if (T >= Tgrid[i * Y + j]) {
-				Rgrid[i * Y + j] = Rmetal;
-			}
-		}
-	}
-	return;
-}
-
-void Tgridupdater( double Tgrid[], int X, int Y, float T) {
-
-	int* Tgridfake = new int[X * Y]();
-	int* Tgridfake2 = new int[X * Y]();
-	double couplingconst=1;
-
-	for (int i = 0; i < X; i++) {
-		for (int j = 0; j < Y; j++) {
-			Tgridfake[i * Y + j] = 0;
-		}
-	}
-
-	for (int i = 0; i < X*Y-1; i++) {
-
-		if (i<X) {
-			if (i%X==0) {
-				//if ((Tgrid[i]> Tgrid[i+1])) {
-					
-					if ((Tgridfake[i]&0b00000000)==0) {
-						//cout << "herezz" << (Tgridfake[i] & 0b00000001) <<endl;
-						Tgrid[i] -= couplingconst;
-						Tgridfake[i] = (Tgridfake[i] | 0b00000001);
-						
-						Tgridfake2[i + 1] = (Tgridfake[i] | 0b00000001);
-					}
-				//}
-				if (Tgrid[i] > Tgrid[i + X]) {
-					if (Tgridfake[i] == 0) {
-						Tgrid[i] -= couplingconst;
-						Tgridfake[i] = 3;
-						Tgridfake2[i + 1] = 1;
-					}
-
-				}
-
-
-
-			}
-			if ((i % X != 0) &&(i % X != X-1)) {
-
-			}
-			if (i % X == X - 1) {
-
-			}
-
-		
-		} 
-		
-		if( i>X && i< X*Y-Y) {
-			if (i % X == 0) {
-
-			}
-			if ((i % X != 0) && (i % X != X - 1)) {
-
-			}
-			if (i % X == X - 1) {
-
-			}
-		
-		} 
-		
-		if(i > X * Y - Y){
-			if (i % X == 0) {
-
-			}
-			if ((i % X != 0) && (i % X != X - 1)) {
-
-			}
-			if (i % X == X - 1) {
-
-			}
-		
-		}
-
-
-	}
-
-
-
-	delete(Tgridfake);
-	delete(Tgridfake2);
-	
-	return;
-}
-
-
-
-
-
-void merge(float array[], int const left,
-	int const mid, int const right)
+// ---------------------------------------------------------------------------
+// Grid initialisation
+// ---------------------------------------------------------------------------
+void Tgridset(double Tgrid[], int X, int Y)
 {
-	auto const subArrayOne = mid - left + 1;
-	auto const subArrayTwo = right - mid;
-
-	// Create temp arrays 
-	auto* leftArray = new float[subArrayOne],
-		* rightArray = new float[subArrayTwo];
-
-	// Copy data to temp arrays leftArray[]  
-	// and rightArray[] 
-	for (int i = 0; i < subArrayOne; i++)
-		leftArray[i] = array[left + i];
-	for (int j = 0; j < subArrayTwo; j++)
-		rightArray[j] = array[mid + 1 + j];
-
-	// Initial index of first sub-array 
-	// Initial index of second sub-array 
-	auto indexOfSubArrayOne = 0,
-		indexOfSubArrayTwo = 0;
-
-	// Initial index of merged array 
-	int indexOfMergedArray = left;
-
-	// Merge the temp arrays back into  
-	// array[left..right] 
-	while (indexOfSubArrayOne < subArrayOne &&
-		indexOfSubArrayTwo < subArrayTwo)
-	{
-		if (leftArray[indexOfSubArrayOne] <=
-			rightArray[indexOfSubArrayTwo])
-		{
-			array[indexOfMergedArray] =
-				leftArray[indexOfSubArrayOne];
-			indexOfSubArrayOne++;
-		}
-		else
-		{
-			array[indexOfMergedArray] =
-				rightArray[indexOfSubArrayTwo];
-			indexOfSubArrayTwo++;
-		}
-		indexOfMergedArray++;
-	}
-
-	// Copy the remaining elements of 
-	// left[], if there are any 
-	while (indexOfSubArrayOne < subArrayOne)
-	{
-		array[indexOfMergedArray] =
-			leftArray[indexOfSubArrayOne];
-		indexOfSubArrayOne++;
-		indexOfMergedArray++;
-	}
-
-	// Copy the remaining elements of 
-	// right[], if there are any 
-	while (indexOfSubArrayTwo < subArrayTwo)
-	{
-		array[indexOfMergedArray] =
-			rightArray[indexOfSubArrayTwo];
-		indexOfSubArrayTwo++;
-		indexOfMergedArray++;
-	}
+    const double mean   = 345.0;
+    const double stddev = 6.0;
+    static std::mt19937 gen(41);
+    static std::normal_distribution<double> dist(mean, stddev);
+    for (int i = 0; i < X; i++)
+        for (int j = 0; j < Y; j++)
+            Tgrid[i*Y+j] = dist(gen);
 }
 
-// begin is for left index and end is 
-// right index of the sub-array 
-// of arr to be sorted */ 
-void mergeSort(float array[],
-	int const begin,
-	int const end)
+void Rgridset(double Rgrid[], int X, int Y, double Rins)
 {
-	// Returns recursively 
-	if (begin >= end)
-		return;
-
-	auto mid = begin + (end - begin) / 2;
-	mergeSort(array, begin, mid);
-	mergeSort(array, mid + 1, end);
-	merge(array, begin, mid, end);
+    for (int i = 0; i < X; i++)
+        for (int j = 0; j < Y; j++)
+            Rgrid[i*Y+j] = Rins;
 }
 
-double g(double const Rgrid[], double const  a, double const b)
+void Rgridupdater(double Rgrid[], double Tgrid[], int X, int Y, int T, double Rmetal)
 {
-	return 2 / (a + b);
+    for (int i = 0; i < X; i++)
+        for (int j = 0; j < Y; j++)
+            if (T >= Tgrid[i*Y+j])
+                Rgrid[i*Y+j] = Rmetal;
 }
 
-void fillgvalsfirstrow(double G[], double Rgrid[], int const X, int const Y)
+// ---------------------------------------------------------------------------
+// Series conductance: g(a,b) = 2/(a+b)
+// ---------------------------------------------------------------------------
+static inline double g(double a, double b) { return 2.0 / (a + b); }
+
+// ---------------------------------------------------------------------------
+// Matrix index for grid node (i,j).  Node 0 is the source bus bar.
+// ---------------------------------------------------------------------------
+static inline int node_idx(int i, int j, int Y) { return 1 + i*Y + j; }
+
+// ---------------------------------------------------------------------------
+// compute_nnz2
+//
+// Number of lower-triangle entries (incl. diagonal) for the
+// (X*Y+1) x (X*Y+1) admittance matrix.
+//
+// Per section:
+//   Source node  (k=0)          :  1
+//   First row    (i=0)          :  2 + 3*(Y-1)
+//   Middle rows  (i=1..X-2)     :  (X-2)*(2+3*(Y-1))
+//   Last row     (i=X-1)        :  2 + 3*(Y-1)   <-- NO source off-diag
+//
+// Total = 1 + X*(2+3*(Y-1)) = 1 + X*(3Y-1)
+// ---------------------------------------------------------------------------
+static inline int compute_nnz2(int X, int Y)
 {
-	G[1] = -2 / Rgrid[0];
-	G[2] = g(Rgrid, Rgrid[0], Rgrid[0 + 1]) + g(Rgrid, Rgrid[0], Rgrid[0 + Y]) + 2 / Rgrid[0];
-
-	int j = 0;
-#pragma omp parallel for
-	for (int i = 0; i < (Y - 2) * 3; i = i + 3) {
-		j++;
-		G[i + 3] = -2 / Rgrid[j];
-		G[i + 4] = -g(Rgrid, Rgrid[j], Rgrid[j - 1]);
-		G[i + 5] = g(Rgrid, Rgrid[j], Rgrid[j + 1]) + g(Rgrid, Rgrid[j], Rgrid[j + Y]) + g(Rgrid, Rgrid[j], Rgrid[j - 1]) + 2 / Rgrid[j];
-	}
-	j++;
-
-	G[(Y - 1) * 3 - 2 - (Y - 1) + (Y + 1)] = -2 / Rgrid[j];
-	G[(Y - 1) * 3 - 1 - (Y - 1) + (Y + 1)] = -g(Rgrid, Rgrid[j], Rgrid[j - 1]);
-	G[(Y - 1) * 3 - (Y - 1) + (Y + 1)] = g(Rgrid, Rgrid[j], Rgrid[j - 1]) + g(Rgrid, Rgrid[j], Rgrid[j + Y]) + 2 / Rgrid[j];
+    return 1 + X * (3*Y - 1);
 }
 
-void fillgvalsfirselement(double G[], double Rgrid[], int const X, int const Y)
+// ---------------------------------------------------------------------------
+// constructRowlind / constructColind
+//
+// Fill row and column index arrays for the lower-triangle triplet.
+// Both follow the same k-order as fillGvals.
+//
+// k-layout:
+//   k=0                         : (0,0)                        source diag
+//
+//   First row (i=0):
+//     k=1                       : (node(0,0), 0)               src off-diag
+//     k=2                       : (node(0,0), node(0,0))       diag
+//     j=1..Y-1:
+//       3+(j-1)*3+0             : (node(0,j), node(0,j-1))     left
+//       3+(j-1)*3+1             : (node(0,j), 0)               src off-diag
+//       3+(j-1)*3+2             : (node(0,j), node(0,j))       diag
+//
+//   Middle row block b (b=0..X-3, grid row i=b+1):
+//     base = 1+(b+1)*(2+3*(Y-1))
+//     base+0                    : (node(i,0), node(i-1,0))     above
+//     base+1                    : (node(i,0), node(i,0))       diag
+//     j=1..Y-1:
+//       base+2+(j-1)*3+0        : (node(i,j), node(i-1,j))    above
+//       base+2+(j-1)*3+1        : (node(i,j), node(i,j-1))    left
+//       base+2+(j-1)*3+2        : (node(i,j), node(i,j))      diag
+//
+//   Last row (i=X-1):
+//     base = 1+(X-1)*(2+3*(Y-1))
+//     base+0                    : (node(X-1,0), node(X-2,0))   above
+//     base+1                    : (node(X-1,0), node(X-1,0))   diag
+//     j=1..Y-1:
+//       base+2+(j-1)*3+0        : (node(X-1,j), node(X-2,j))  above
+//       base+2+(j-1)*3+1        : (node(X-1,j), node(X-1,j-1))left
+//       base+2+(j-1)*3+2        : (node(X-1,j), node(X-1,j))  diag
+// ---------------------------------------------------------------------------
+void constructRowlind(int Rowlind[], int /*nnz*/, int X, int Y)
 {
-	G[0] = -G[1];
-	for (int i = 3; i < (Y - 1) * 3 + 1; i = i + 3) {
-		G[0] = G[0] - G[i];
-	}
+    int k = 0;
+
+    Rowlind[k++] = 0;  // source diagonal
+
+    // First row
+    Rowlind[k++] = node_idx(0, 0, Y);
+    Rowlind[k++] = node_idx(0, 0, Y);
+    for (int j = 1; j < Y; j++) {
+        Rowlind[k++] = node_idx(0, j, Y);
+        Rowlind[k++] = node_idx(0, j, Y);
+        Rowlind[k++] = node_idx(0, j, Y);
+    }
+
+    // Middle rows
+    for (int i = 1; i <= X-2; i++) {
+        Rowlind[k++] = node_idx(i, 0, Y);
+        Rowlind[k++] = node_idx(i, 0, Y);
+        for (int j = 1; j < Y; j++) {
+            Rowlind[k++] = node_idx(i, j, Y);
+            Rowlind[k++] = node_idx(i, j, Y);
+            Rowlind[k++] = node_idx(i, j, Y);
+        }
+    }
+
+    // Last row
+    Rowlind[k++] = node_idx(X-1, 0, Y);
+    Rowlind[k++] = node_idx(X-1, 0, Y);
+    for (int j = 1; j < Y; j++) {
+        Rowlind[k++] = node_idx(X-1, j, Y);
+        Rowlind[k++] = node_idx(X-1, j, Y);
+        Rowlind[k++] = node_idx(X-1, j, Y);
+    }
 }
 
-void fillgvalsmid(double G[], double Rgrid[], int const X, int const Y, int nnz)
+void constructColind(int Colind[], int /*nnz*/, int X, int Y)
 {
-	int offset1 = 1 + (Y - 1) * 2 + (Y + 1);//(Y + 1) + 3 + ((Y - 1) * 3);
-	int j = Y;
-	//#pragma omp parallel for
-	for (int k = 0; k < X - 2; k++) {
+    int k = 0;
 
-		int i = 0;
-		offset1 = 1 + (Y - 1) * 2 + (Y + 1) - 2 * k;
-		G[(k) * ((Y - 2) * 3 + 7) + offset1] = -g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - Y]);
-		G[(k) * ((Y - 2) * 3 + 7) + offset1 + 1] = g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - Y]) + g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i + 1]) + g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i + Y]);
+    Colind[k++] = 0;  // source diagonal
 
-		int c = (k) * ((Y - 2) * 3 + 7);
-		int d = j + Y * k;
-		
-		#pragma ivdep
-		for (int i = 1; i < Y - 1; i++) {
+    // First row
+    Colind[k++] = 0;                         // src off-diag
+    Colind[k++] = node_idx(0, 0, Y);         // diag
+    for (int j = 1; j < Y; j++) {
+        Colind[k++] = node_idx(0, j-1, Y);  // left
+        Colind[k++] = 0;                     // src off-diag
+        Colind[k++] = node_idx(0, j,  Y);   // diag
+    }
 
+    // Middle rows
+    for (int i = 1; i <= X-2; i++) {
+        Colind[k++] = node_idx(i-1, 0, Y);  // above
+        Colind[k++] = node_idx(i,   0, Y);  // diag
+        for (int j = 1; j < Y; j++) {
+            Colind[k++] = node_idx(i-1, j,   Y);  // above
+            Colind[k++] = node_idx(i,   j-1, Y);  // left
+            Colind[k++] = node_idx(i,   j,   Y);  // diag
+        }
+    }
 
-			//cout << "offset2:" << offset1 << endl;
-			//cout << "k:" << k << endl;
-			//cout << "i:" << i << endl;
-			offset1 = 1 + (Y - 1) * 2 + (Y + 1) - 2 * k - 1;
-			//cout << "offset22:" << offset1 << endl;
-			double h= Rgrid[d + i];
-			double a = g(Rgrid, h, Rgrid[d + i - Y]);
-			double b = g(Rgrid, h, Rgrid[d + i - 1]);
-			int f = i * 3;
-			
-			G[c + f + offset1] = -a;
-			G[c + f + offset1 + 1] = -b;
-			G[c + f + offset1 + 2] = a + b + g(Rgrid, h, Rgrid[d + i + 1]) + g(Rgrid, h, Rgrid[d + i + Y]);
-
-		}
-
-		i = Y - 1;
-		offset1 = 1 + (Y - 1) * 2 + (Y + 1) - 2 * k - 1;
-		G[(k) * ((Y - 2) * 3 + 7) + i * 3 + offset1] = -g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - Y]);
-		G[(k) * ((Y - 2) * 3 + 7) + i * 3 + offset1 + 1] = -g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - 1]);
-		G[(k) * ((Y - 2) * 3 + 7) + i * 3 + offset1 + 2] = g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - Y]) + g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i - 1]) + g(Rgrid, Rgrid[j + Y * k + i], Rgrid[j + Y * k + i + Y]);
-
-
-	}
+    // Last row
+    Colind[k++] = node_idx(X-2, 0, Y);  // above
+    Colind[k++] = node_idx(X-1, 0, Y);  // diag
+    for (int j = 1; j < Y; j++) {
+        Colind[k++] = node_idx(X-2, j,   Y);  // above
+        Colind[k++] = node_idx(X-1, j-1, Y);  // left
+        Colind[k++] = node_idx(X-1, j,   Y);  // diag
+    }
 }
 
-void fillgvalslastrow(double G[], double Rgrid[], int const X, int const Y, int nnz)
+// ---------------------------------------------------------------------------
+// fillGvals — compute conductance values in the same k-order as the index
+// arrays.  Call fillGvalsSourceDiag() afterwards to set Gvals[0].
+// ---------------------------------------------------------------------------
+void fillGvals(double Gvals[], const double Rgrid[], int X, int Y)
 {
-	G[(nnz - 1) + (Y + 1) - 4 * (Y - 1) - 3] = -g(Rgrid, Rgrid[X * Y - 1 - (Y - 1)], Rgrid[X * Y - 1 - (Y - 1) - Y]);
-	G[(nnz - 1) + (Y + 1) - 4 * (Y - 1) - 2] = g(Rgrid, Rgrid[X * Y - 1 - (Y - 1)], Rgrid[X * Y - 1 - (Y - 1) + 1]) + g(Rgrid, Rgrid[X * Y - 1 - (Y - 1)], Rgrid[X * Y - 1 - (Y - 1) - Y]) + 2 / Rgrid[X * Y - 1 - (Y - 1)];
+    // Helper lambdas
+    auto R = [&](int i, int j) -> double { return Rgrid[i*Y + j]; };
+    auto G = [&](int ia, int ja, int ib, int jb) -> double {
+        return g(Rgrid[ia*Y+ja], Rgrid[ib*Y+jb]);
+    };
 
-	int j = 0;
-	int offset2 = (nnz - 1) + (Y + 1) - 4 * (Y - 1) - 2 - 2;
+    int k = 0;
+    k++;  // Gvals[0] filled by fillGvalsSourceDiag
 
-#pragma omp parallel for
-	for (int i = 2; i < Y; i++) {
-		G[offset2 + (i - 2) * 3 + 3] = -g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)], Rgrid[X * Y - 1 - Y + (-(Y - 1) + i - 1)]);
-		G[offset2 + (i - 2) * 3 + 4] = -g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)], Rgrid[X * Y - 1 + (-(Y - 1) + i - 1) - 1]);
-		G[offset2 + (i - 2) * 3 + 5] = g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)], Rgrid[X * Y - 1 + (-(Y - 1) + i - 1) - 1]) + g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)], Rgrid[X * Y - 1 + 1 + (-(Y - 1) + i - 1)]) + g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)], Rgrid[X * Y - 1 - Y + (-(Y - 1) + i - 1)]) + 2 / Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)];
-		//G[offset2 + (i - 2) * 5 + 4] = -g(Rgrid, Rgrid[X * Y - 1 + (-(Y - 1) + i)], Rgrid[X * Y - 1 + (-(Y - 1) + i) - 1]);
-		//cout << "here11:"  << X * Y - 1 - (i - 1) << endl;
-		//cout << "here22:" << X * Y - 1 + (-(Y - 1) + i -1) << endl;
-		//G[offset2 + (i - 2) * 5 + 5] = -2 / Rgrid[X * Y - 1 + (-(Y - 1) + i - 1)]; //+(-(Y - 1) + i + 1)
-		j++;
-		//int a = omp_get_thread_num();
-		//cout << "Hello from thread: " << a << "\n";
-	}
-	j++;
+    // ------------------------------------------------------------------
+    // First row (i=0): source off-diagonals present
+    // ------------------------------------------------------------------
+    {
+        double src  = 2.0 / R(0,0);
+        double rgt  = (Y > 1) ? G(0,0, 0,1) : 0.0;
+        double blw  = G(0,0, 1,0);
+        Gvals[k++] = -src;                 // off-diag to source (node 0)
+        Gvals[k++] =  src + rgt + blw;    // diagonal
 
-	G[nnz - 1 - 2] = -g(Rgrid, Rgrid[X * Y - 1], Rgrid[X * Y - 1 - Y]);
-	G[nnz - 1 - 1] = -g(Rgrid, Rgrid[X * Y - 1], Rgrid[X * Y - 1 - 1]);
-	G[nnz - 1 - 0] = g(Rgrid, Rgrid[X * Y - 1], Rgrid[X * Y - 1 - 1]) + g(Rgrid, Rgrid[X * Y - 1], Rgrid[X * Y - 1 - Y]) + 2 / Rgrid[X * Y - 1];
+        for (int j = 1; j < Y; j++) {
+            double lft  = G(0,j, 0,j-1);
+            double rgt2 = (j < Y-1) ? G(0,j, 0,j+1) : 0.0;
+            double blw2 = G(0,j, 1,j);
+            double src2 = 2.0 / R(0,j);
+            Gvals[k++] = -lft;                       // left
+            Gvals[k++] = -src2;                      // off-diag to source
+            Gvals[k++] =  lft + rgt2 + blw2 + src2; // diagonal
+        }
+    }
 
+    // ------------------------------------------------------------------
+    // Middle rows (i=1..X-2): no bus bar off-diagonal
+    // ------------------------------------------------------------------
+    for (int i = 1; i <= X-2; i++) {
+        double abv = G(i,0, i-1,0);
+        double rgt = (Y > 1) ? G(i,0, i,1) : 0.0;
+        double blw = G(i,0, i+1,0);
+        Gvals[k++] = -abv;
+        Gvals[k++] =  abv + rgt + blw;
+
+        for (int j = 1; j < Y; j++) {
+            double abv2 = G(i,j, i-1,j);
+            double lft2 = G(i,j, i,j-1);
+            double rgt2 = (j < Y-1) ? G(i,j, i,j+1) : 0.0;
+            double blw2 = G(i,j, i+1,j);
+            Gvals[k++] = -abv2;
+            Gvals[k++] = -lft2;
+            Gvals[k++] =  abv2 + lft2 + rgt2 + blw2;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Last row (i=X-1): sink bus bar is DIAGONAL ONLY (node eliminated).
+    // The 2/R term appears only in the diagonal, not as an off-diagonal
+    // entry — there is no column for the sink node in the matrix.
+    // ------------------------------------------------------------------
+    {
+        double abv  = G(X-1,0, X-2,0);
+        double rgt  = (Y > 1) ? G(X-1,0, X-1,1) : 0.0;
+        double sink = 2.0 / R(X-1,0);
+        Gvals[k++] = -abv;
+        Gvals[k++] =  abv + rgt + sink;   // diagonal absorbs sink term
+
+        for (int j = 1; j < Y; j++) {
+            double abv2  = G(X-1,j, X-2,j);
+            double lft2  = G(X-1,j, X-1,j-1);
+            double rgt2  = (j < Y-1) ? G(X-1,j, X-1,j+1) : 0.0;
+            double sink2 = 2.0 / R(X-1,j);
+            Gvals[k++] = -abv2;
+            Gvals[k++] = -lft2;
+            Gvals[k++] =  abv2 + lft2 + rgt2 + sink2;
+        }
+    }
 }
 
-void constructColind(int Colind[], int nnz, int const X, int const Y)
+// ---------------------------------------------------------------------------
+// fillGvalsSourceDiag — sets Gvals[0] = -sum of source off-diagonal entries.
+// Must be called AFTER fillGvals().
+//
+// Source off-diagonal entries live at:
+//   k=1 (node(0,0)) and k=3+(j-1)*3+1 for j=1..Y-1
+// ---------------------------------------------------------------------------
+void fillGvalsSourceDiag(double Gvals[], int /*X*/, int Y)
 {
-	Colind[0] = 0;
-	Colind[1] = 1;
-	Colind[2] = 1;
-
-	for (int i = 0; i < (Y - 1); i++) {
-		Colind[i * 3 + 3] = i + 2;
-		Colind[i * 3 + 4] = i + 2;
-		Colind[i * 3 + 5] = i + 2;
-	}
-
-	int offset = 1 + (Y - 1) * 2 + (Y + 1);
-
-	for (int i = 0; i < (X - 2); i++)
-	{
-		for (int j = 0; j < 3 * (Y - 2); j++)
-		{
-			if (j == 0)
-			{
-				Colind[i * ((Y - 1) * 3 + 2) + offset] = 1 + i * (Y)+Y;
-				Colind[i * ((Y - 1) * 3 + 2) + offset + 1] = 1 + i * (Y)+Y;//2 + j;
-			}
-			if (j > 0 && j < Y)
-			{
-				Colind[i * ((Y - 1) * 3 + 2) + j * 3 + offset - 1] = 1 + i * (Y)+j + Y;
-				Colind[i * ((Y - 1) * 3 + 2) + j * 3 + offset] = 1 + i * (Y)+j + Y;
-				Colind[i * ((Y - 1) * 3 + 2) + j * 3 + offset + 1] = 1 + i * (Y)+j + Y;
-			}
-		}
-	}
-
-	int offset2 = (nnz - 1) - (offset)+1;
-	Colind[offset2 + 1] = 1 + (X - 2) * (Y)+Y;
-	Colind[offset2 + 2] = 1 + (X - 2) * (Y)+Y;
-
-	for (int i = 1; i < Y; i++) {
-		Colind[offset2 + 2 + (i * 3) - 2] = 1 + (X - 2) * (Y)+i + Y;
-		Colind[offset2 + 2 + (i * 3) - 1] = 1 + (X - 2) * (Y)+i + Y;
-		Colind[offset2 + 2 + (i * 3)] = 1 + (X - 2) * (Y)+i + Y;
-	}
-
+    double sum = Gvals[1];  // node(0,0)
+    for (int j = 1; j < Y; j++)
+        sum += Gvals[3 + (j-1)*3 + 1];
+    Gvals[0] = -sum;
 }
 
-void constructRowlind(int Rowlind[], int nnz, int const X, int const Y)
+// ---------------------------------------------------------------------------
+// Merge sort (unchanged)
+// ---------------------------------------------------------------------------
+void merge(float array[], int const left, int const mid, int const right)
 {
-	Rowlind[0] = 0;
-	Rowlind[1] = 0;
-	Rowlind[2] = 1;
-
-	for (int i = 0; i < (Y - 1); i++) {
-		Rowlind[i * 3 + 3] = 0;
-		Rowlind[i * 3 + 4] = i + 1;
-		Rowlind[i * 3 + 5] = i + 2;
-	}
-
-	int offset = (Y - 2) * 2 + 2 + 1 + (Y + 1);
-
-	for (int i = 0; i < (X - 2); i++)
-	{
-		for (int j = 0; j < 3 * (Y - 2); j++)
-		{
-			if (j == 0)
-			{
-				Rowlind[i * ((Y - 1) * 3 + 2) + offset] = 1 + i * (Y)+j;
-				Rowlind[i * ((Y - 1) * 3 + 2) + offset + 1] = 1 + i * (Y)+Y;//2 + j;
-			}
-			if (j > 0 && j < Y)
-			{
-				Rowlind[i * ((Y - 1) * 3 + 2) + j * 3 + offset - 1] = 1 + i * (Y)+j;
-				Rowlind[i * ((Y - 1) * 3 + 2) + j * 3 + offset] = 1 + i * (Y)+j + Y - 1;
-				Rowlind[i * ((Y - 1) * 3 + 2) + j * 3 + offset + 1] = 1 + i * (Y)+j + Y;
-			}
-
-		}
-	}
-
-	int offset2 = (nnz - 1) - (2 + 3 * (Y - 1));
-	Rowlind[offset2 + 1] = 1 + (X - 2) * (Y);
-	Rowlind[offset2 + 2] = 1 + (X - 2) * (Y)+Y;
-
-
-	for (int i = 1; i < Y; i++) {
-		Rowlind[offset2 + 2 + (i * 3) - 2] = 1 + (X - 2) * (Y)+i;
-		Rowlind[offset2 + 2 + (i * 3) - 1] = 1 + (X - 2) * (Y)+i + Y - 1;
-		Rowlind[offset2 + 2 + (i * 3)] = 1 + (X - 2) * (Y)+i + Y;
-	}
-
+    int n1 = mid - left + 1, n2 = right - mid;
+    auto* L = new float[n1]; auto* R = new float[n2];
+    for (int i = 0; i < n1; i++) L[i] = array[left + i];
+    for (int j = 0; j < n2; j++) R[j] = array[mid + 1 + j];
+    int i = 0, j = 0, m = left;
+    while (i < n1 && j < n2) array[m++] = (L[i] <= R[j]) ? L[i++] : R[j++];
+    while (i < n1) array[m++] = L[i++];
+    while (j < n2) array[m++] = R[j++];
+    delete[] L; delete[] R;
 }
 
-
-
-
-
-
+void mergeSort(float array[], int const begin, int const end)
+{
+    if (begin >= end) return;
+    int mid = begin + (end - begin) / 2;
+    mergeSort(array, begin, mid);
+    mergeSort(array, mid + 1, end);
+    merge(array, begin, mid, end);
+}
