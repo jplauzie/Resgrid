@@ -7,26 +7,27 @@
 #include <algorithm>
 #include <chrono>
 #include <stdlib.h>
+#include <set>
 #include "Header.h"
+#include "visualization.h"
+
+// --- ADD: stb_image_write ---
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 using namespace std::chrono;
+
+
 
 int main(void) {
     // --- MKL DIAGNOSTIC MODE ---
     const char* threads = "4"; 
-	// This tells MKL to be extra careful with memory buffers
-	_putenv_s("MKL_PARDISO_ALIGNMENT", "64"); 
-	// This forces MKL to use a more conservative threading layer
-	_putenv_s("MKL_INTERFACE_LAYER", "ILP64");
-	_putenv_s("MKL_THREADING_LAYER", "INTEL");
+    _putenv_s("MKL_PARDISO_ALIGNMENT", "64"); 
+    _putenv_s("MKL_INTERFACE_LAYER", "ILP64");
+    _putenv_s("MKL_THREADING_LAYER", "INTEL");
     _putenv_s("MKL_NUM_THREADS", "1");
-    //_putenv_s("OMP_NUM_THREADS", "1");
-    
-    // TURN ON MKL VERBOSE OUTPUT
-    //_putenv_s("MKL_VERBOSE", "1");
 
     printf("--- SuiteSparse Diagnostic: MKL_VERBOSE enabled (%s Threads) ---\n", threads);
-	
 
     cholmod_common c;
     cholmod_l_start(&c);
@@ -35,11 +36,11 @@ int main(void) {
     c.final_ll = 1;
     c.nmethods = 1;
     c.method[0].ordering = CHOLMOD_AMD;
-	c.nthreads_max=1;
-	printf("cholmodthreads: %ld\n", c.nthreads_max);
-	printf("\n");
+    c.nthreads_max=1;
+    printf("cholmodthreads: %ld\n", c.nthreads_max);
+    printf("\n");
 
-    const SuiteSparse_long X = 1000, Y = 1000;
+    const SuiteSparse_long X = 100, Y = 100;
     const SuiteSparse_long n = X * Y + 1;
     const SuiteSparse_long nnz2 = compute_nnz2(X, Y);
 
@@ -89,17 +90,17 @@ int main(void) {
     printf("\n>>> ENTERING SIMULATION LOOP. MKL VERBOSE OUTPUT WILL BEGIN NOW. <<<\n\n");
     fflush(stdout);
 
-	FILE* f = fopen("results.dat", "w");
-	if (!f) { printf("ERROR: could not open results.dat\n"); exit(1); }
-		fprintf(f, "# temp x0 rcond loop_time_microsec\n");
-    // Just one step needed to catch the crash
-    for (int step = 0; step <= 75; step++) {
-		auto step_start = high_resolution_clock::now();
-        double temp = 300.0 + (double)step;
-		printf("temp: %.2f\n", temp);
+    FILE* f = fopen("results.dat", "w");
+    if (!f) { printf("ERROR: could not open results.dat\n"); exit(1); }
+    fprintf(f, "# temp x0 rcond loop_time_microsec\n");
 
-		
-		
+    // --- ADD: temperatures at which to save images ---
+    std::set<int> save_temps = {305,340,345,350,375};
+
+    for (int step = 0; step <= 75; step++) {
+        auto step_start = high_resolution_clock::now();
+        double temp = 300.0 + (double)step;
+        printf("temp: %.2f\n", temp);
 
         for (SuiteSparse_long i = 0; i < X * Y; i++) if (temp >= Tgrid[i]) Rgrid[i] = 1.0;
         fillGvals(Gvals.get(), Rgrid.get(), X, Y);
@@ -120,16 +121,27 @@ int main(void) {
         
         printf("--- Calling cholmod_l_solve ---\n"); fflush(stdout);
         x = cholmod_l_solve(CHOLMOD_A, L, b, &c);
-		
-		auto step_end = high_resolution_clock::now();
-		fprintf(f, "%f %f\n", temp,((double*)x->x)[0] );
+
+        // --- ADD: save image if temp matches ---
+        int temp_int = static_cast<int>(temp + 0.5);
+        if (save_temps.count(temp_int)) {
+            char filename[64];
+            sprintf(filename, "rgrid_%d.png", temp_int);
+            save_rgrid_png(filename, Rgrid.get(), X, Y);
+            printf("Saved image: %s\n", filename);
+        }
+
+        auto step_end = high_resolution_clock::now();
+        fprintf(f, "%f %f\n", temp,((double*)x->x)[0] );
         double duration_ms = duration<double, std::milli>(step_end - step_start).count();
-		if (x && x->x) {
+
+        if (x && x->x) {
             printf("Step %d: %.2f ms | V[0]: %.4f\n", step, duration_ms, ((double*)x->x)[0]);
         }
         fflush(stdout);
     }
-	fclose(f);
+
+    fclose(f);
 
     cholmod_l_free_factor(&L, &c);
     cholmod_l_free_sparse(&A, &c);

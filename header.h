@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <random>
 
+
+
 typedef int64_t SuiteSparse_long;
 
 static inline double g(double a, double b) { return 2.0 / (a + b); }
@@ -18,7 +20,7 @@ static inline SuiteSparse_long compute_nnz2(SuiteSparse_long X, SuiteSparse_long
 
 void Tgridset(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y) {
     static std::mt19937 gen(41);
-    static std::normal_distribution<double> dist(345.0, 6.0);
+    static std::normal_distribution<double> dist(345.0, 10.0);
     for (SuiteSparse_long i = 0; i < X * Y; i++) Tgrid[i] = dist(gen);
 }
 
