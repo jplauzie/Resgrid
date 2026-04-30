@@ -1,0 +1,60 @@
+// Performs y = A * x (Matrix-Vector Multiply)
+void apply_A(cholmod_sparse* A, cholmod_dense* x, cholmod_dense* y, cholmod_common* c) {
+    double alpha[2] = {1,0}, beta[2] = {0,0};
+    cholmod_l_sdmult(A, 0, alpha, beta, x, y, c);
+}
+
+// Performs x = (LL')^-1 * b (Preconditioner Step)
+void apply_Preconditioner(cholmod_factor* L, cholmod_dense* b, cholmod_dense* x, cholmod_common* c) {
+    // This is the "magic" - uses the OLD factor to solve the new system approximately
+    cholmod_dense* tmp = cholmod_l_solve(CHOLMOD_A, L, b, c);
+    memcpy(x->x, tmp->x, x->nrow * sizeof(double));
+    cholmod_l_free_dense(&tmp, c);
+}
+
+// PCG Solver
+int solve_pcg(cholmod_sparse* A, cholmod_factor* L, cholmod_dense* b, cholmod_dense* x, cholmod_common* c, double tol = 1e-6) {
+    int n = A->nrow;
+    cholmod_dense *r = cholmod_l_copy_dense(b, c);
+    cholmod_dense *p = cholmod_l_zeros(n, 1, CHOLMOD_REAL, c);
+    cholmod_dense *z = cholmod_l_zeros(n, 1, CHOLMOD_REAL, c);
+    cholmod_dense *Ap = cholmod_l_zeros(n, 1, CHOLMOD_REAL, c);
+
+    // Initial r = b - Ax (assuming initial x is from previous step)
+    apply_A(A, x, Ap, c);
+    for(int i=0; i<n; i++) ((double*)r->x)[i] -= ((double*)Ap->x)[i];
+
+    // z = M^-1 r
+    apply_Preconditioner(L, r, z, c);
+    memcpy(p->x, z->x, n * sizeof(double));
+    
+    double rz = 0, rz_new = 0;
+    for(int i=0; i<n; i++) rz += ((double*)r->x)[i] * ((double*)z->x)[i];
+
+    int iter = 0;
+    for(iter = 0; iter < 100; iter++) { // Max 100 iterations
+        if (rz < tol * tol) break;
+
+        apply_A(A, p, Ap, c);
+        double pAp = 0;
+        for(int i=0; i<n; i++) pAp += ((double*)p->x)[i] * ((double*)Ap->x)[i];
+        
+        double alpha = rz / pAp;
+        for(int i=0; i<n; i++) {
+            ((double*)x->x)[i] += alpha * ((double*)p->x)[i];
+            ((double*)r->x)[i] -= alpha * ((double*)Ap->x)[i];
+        }
+
+        apply_Preconditioner(L, r, z, c);
+        rz_new = 0;
+        for(int i=0; i<n; i++) rz_new += ((double*)r->x)[i] * ((double*)z->x)[i];
+        
+        double beta = rz_new / rz;
+        for(int i=0; i<n; i++) ((double*)p->x)[i] = ((double*)z->x)[i] + beta * ((double*)p->x)[i];
+        rz = rz_new;
+    }
+
+    cholmod_l_free_dense(&r, c); cholmod_l_free_dense(&p, c);
+    cholmod_l_free_dense(&z, c); cholmod_l_free_dense(&Ap, c);
+    return iter;
+}

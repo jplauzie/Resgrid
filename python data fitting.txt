@@ -1,0 +1,79 @@
+import numpy as np
+import subprocess
+from scipy.optimize import minimize
+from scipy.stats import linregress
+
+# --- 1. LOAD EXPERIMENTAL DATA ---
+# Assuming you have a CSV with columns: Temp, R_heating, R_cooling
+exp_data = np.loadtxt("experimental_data.csv", delimiter=",", skiprows=1)
+exp_T = exp_data[:, 0]
+exp_R_up = exp_data[:, 1]
+exp_R_down = exp_data[:, 2]
+
+# --- 2. THE "PHYSICIST" EXTRACTION ---
+print("Extracting static parameters from data tails...")
+
+# A. Extract R_metal (Average resistance above 370K)
+high_temp_mask = exp_T > 370.0
+R_metal_fixed = np.mean(exp_R_up[high_temp_mask])
+print(f"-> Extracted R_metal: {R_metal_fixed:.4f} Ohms")
+
+# B. Extract Alpha (Linear fit of ln(R) vs 1/T for T < 320K)
+low_temp_mask = exp_T < 320.0
+T_low = exp_T[low_temp_mask]
+R_low = exp_R_up[low_temp_mask]
+
+# Arrhenius equation: ln(R) = ln(R_ref) + alpha * (1/T - 1/T_ref)
+slope, intercept, r_value, p_value, std_err = linregress(1.0 / T_low, np.log(R_low))
+alpha_fixed = slope # slope is exactly alpha!
+print(f"-> Extracted Alpha: {alpha_fixed:.2f}")
+
+# --- 3. THE "COMPUTER" OPTIMIZATION ---
+
+def cost_function(params):
+    T_mean, T_std, J = params
+    
+    # 1. Run the C++ Simulation
+    # Format: ./vo2_sim [alpha] [R_met] [T_mean] [T_std] [J]
+    cmd = f"./vo2_sim {alpha_fixed} {R_metal_fixed} {T_mean} {T_std} {J}"
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL) # Hide C++ prints
+    
+    # 2. Load the Simulation Results
+    try:
+        sim_up = np.loadtxt("results_up.dat")
+        sim_down = np.loadtxt("results_down.dat")
+    except:
+        return 1e9 # Return massive error if simulation crashed/failed
+        
+    sim_T_up, sim_R_up = sim_up[:, 0], sim_up[:, 1]
+    sim_T_down, sim_R_down = sim_down[:, 0], sim_down[:, 1]
+    
+    # 3. Calculate Error (Mean Squared Error in Log Space)
+    # We use log space because R drops by orders of magnitude; 
+    # otherwise, the error metric only cares about the insulating state.
+    # Note: np.interp aligns the simulation temperatures with the experimental ones
+    interp_sim_R_up = np.interp(exp_T, sim_T_up, sim_R_up)
+    interp_sim_R_down = np.interp(exp_T, sim_T_down, sim_R_down)
+    
+    error_up = np.mean((np.log10(exp_R_up) - np.log10(interp_sim_R_up))**2)
+    error_down = np.mean((np.log10(exp_R_down) - np.log10(interp_sim_R_down))**2)
+    
+    total_error = error_up + error_down
+    print(f"Trying T_mean={T_mean:.2f}, T_std={T_std:.2f}, J={J:.2f} | Error: {total_error:.4f}")
+    
+    return total_error
+
+# Initial Guesses for the Optimizer: [T_mean, T_std, J]
+initial_guess = [350.0, 10.0, 15.0]
+
+print("\nStarting 3-Parameter Optimization...")
+# Nelder-Mead is gradient-free, making it perfect for percolation simulations
+result = minimize(cost_function, initial_guess, method='Nelder-Mead', 
+                  options={'disp': True, 'xatol': 0.1, 'fatol': 0.01})
+
+print("\n=== OPTIMIZATION COMPLETE ===")
+print(f"Alpha:  {alpha_fixed:.2f} (Fixed)")
+print(f"R_met:  {R_metal_fixed:.4f} (Fixed)")
+print(f"T_mean: {result.x[0]:.2f}")
+print(f"T_std:  {result.x[1]:.2f}")
+print(f"J:      {result.x[2]:.2f}")
