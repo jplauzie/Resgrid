@@ -1,7 +1,7 @@
 #ifndef HEADER_H
 #define HEADER_H
 
-#include <stdint.h>
+#include <petscsys.h>
 #include <random>
 #include <queue>
 #include <vector>
@@ -9,45 +9,44 @@
 #include <cmath>
 #include <algorithm>
 
-typedef int64_t SuiteSparse_long;
-
+// PetscInt replaces SuiteSparse_long throughout
 static inline double g(double a, double b) { return 2.0 / (a + b); }
 
-static inline SuiteSparse_long node_idx(SuiteSparse_long i, SuiteSparse_long j, SuiteSparse_long Y) { 
-    return 1 + i * Y + j; 
+static inline PetscInt node_idx(PetscInt i, PetscInt j, PetscInt Y) {
+    return 1 + i * Y + j;
 }
 
-static inline SuiteSparse_long compute_nnz2(SuiteSparse_long X, SuiteSparse_long Y) {
+static inline PetscInt compute_nnz2(PetscInt X, PetscInt Y) {
     return 1 + (X * Y * 3);
 }
 
-void Tgridset(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y, double mean, double std_dev) {
+void Tgridset(double Tgrid[], PetscInt X, PetscInt Y, double mean, double std_dev) {
     static std::mt19937 gen(41);
     std::normal_distribution<double> dist(mean, std_dev);
-    for (SuiteSparse_long i = 0; i < X * Y; i++) Tgrid[i] = dist(gen);
+    for (PetscInt i = 0; i < X * Y; i++) Tgrid[i] = dist(gen);
 }
 
-void Rgridset(double Rgrid[], SuiteSparse_long X, SuiteSparse_long Y, double Rins) {
-    for (SuiteSparse_long i = 0; i < X * Y; i++) Rgrid[i] = Rins;
+void Rgridset(double Rgrid[], PetscInt X, PetscInt Y, double Rins) {
+    for (PetscInt i = 0; i < X * Y; i++) Rgrid[i] = Rins;
 }
 
-void constructRowlind(SuiteSparse_long Rowlind[], SuiteSparse_long X, SuiteSparse_long Y) {
-    SuiteSparse_long k = 0;
-    Rowlind[k++] = 0; 
-    for (SuiteSparse_long i = 0; i < X; i++) {
-        for (SuiteSparse_long j = 0; j < Y; j++) {
-            SuiteSparse_long cur = node_idx(i, j, Y);
+void constructRowlind(PetscInt Rowlind[], PetscInt X, PetscInt Y) {
+    PetscInt k = 0;
+    Rowlind[k++] = 0;
+    for (PetscInt i = 0; i < X; i++) {
+        for (PetscInt j = 0; j < Y; j++) {
+            PetscInt cur = node_idx(i, j, Y);
             Rowlind[k++] = cur; Rowlind[k++] = cur; Rowlind[k++] = cur;
         }
     }
 }
 
-void constructColind(SuiteSparse_long Colind[], SuiteSparse_long X, SuiteSparse_long Y) {
-    SuiteSparse_long k = 0;
-    Colind[k++] = 0; 
-    for (SuiteSparse_long i = 0; i < X; i++) {
-        for (SuiteSparse_long j = 0; j < Y; j++) {
-            SuiteSparse_long cur = node_idx(i, j, Y);
+void constructColind(PetscInt Colind[], PetscInt X, PetscInt Y) {
+    PetscInt k = 0;
+    Colind[k++] = 0;
+    for (PetscInt i = 0; i < X; i++) {
+        for (PetscInt j = 0; j < Y; j++) {
+            PetscInt cur = node_idx(i, j, Y);
             if (i == 0) Colind[k++] = 0;
             else        Colind[k++] = node_idx(i - 1, j, Y);
             if (j > 0) Colind[k++] = node_idx(i, j - 1, Y);
@@ -57,50 +56,66 @@ void constructColind(SuiteSparse_long Colind[], SuiteSparse_long X, SuiteSparse_
     }
 }
 
-static void updateAx(double* Ax, SuiteSparse_long nzmax, const double* Rgrid, const SuiteSparse_long* triplet_to_csc, SuiteSparse_long X, SuiteSparse_long Y) {
-    std::fill(Ax, Ax + nzmax, 0.0);
-    SuiteSparse_long k = 1;
-    for (SuiteSparse_long i = 0; i < X; i++) {
-        for (SuiteSparse_long j = 0; j < Y; j++) {
+// Computes the lower-triangle nonzero values for the conductance matrix.
+// Values are indexed identically to Rowlind/Colind from constructRowlind/constructColind.
+// The caller (main.cpp) symmetrizes when inserting into the PETSc Mat.
+static void computeAxValues(double* values, const double* Rgrid, PetscInt X, PetscInt Y) {
+    PetscInt k = 1;
+
+    // Source node diagonal (node 0): sum of conductances to first row
+    double source_diag = 0.0;
+    for (PetscInt j = 0; j < Y; j++) source_diag += 2.0 / Rgrid[j];
+    values[0] = source_diag;
+
+    for (PetscInt i = 0; i < X; i++) {
+        for (PetscInt j = 0; j < Y; j++) {
             double diag = 0.0;
+
+            // Off-diagonal: connection upward (to source node 0 if i==0)
             if (i == 0) {
                 double s = 2.0 / Rgrid[i * Y + j];
-                Ax[triplet_to_csc[k++]] = -s; diag += s;
+                values[k++] = -s;
+                diag += s;
             } else {
                 double a = g(Rgrid[i * Y + j], Rgrid[(i - 1) * Y + j]);
-                Ax[triplet_to_csc[k++]] = -a; diag += a;
+                values[k++] = -a;
+                diag += a;
             }
+
+            // Off-diagonal: connection left
             if (j > 0) {
                 double l = g(Rgrid[i * Y + j], Rgrid[i * Y + (j - 1)]);
-                Ax[triplet_to_csc[k++]] = -l; diag += l;
-            } else k++;
+                values[k++] = -l;
+                diag += l;
+            } else {
+                values[k++] = 0.0;  // placeholder (diagonal duplicate in original)
+            }
 
+            // Diagonal: accumulate contributions from all 4 neighbors
             if (i < X - 1) diag += g(Rgrid[i * Y + j], Rgrid[(i + 1) * Y + j]);
-            else           diag += 2.0 / Rgrid[(X - 1) * Y + j]; 
+            else            diag += 2.0 / Rgrid[(X - 1) * Y + j];  // bottom boundary
             if (j < Y - 1) diag += g(Rgrid[i * Y + j], Rgrid[i * Y + (j + 1)]);
-            Ax[triplet_to_csc[k++]] += diag;
+
+            values[k++] = diag;
         }
     }
-    double source_diag = 0.0;
-    for (SuiteSparse_long j = 0; j < Y; j++) source_diag += 2.0 / Rgrid[j];
-    Ax[triplet_to_csc[0]] = source_diag;
 }
 
-// --- TWO-MAP CASCADE LOGIC ---
+// --- TWO-MAP CASCADE LOGIC (unchanged) ---
 
 struct Grain {
-    SuiteSparse_long idx;
+    PetscInt idx;
     double threshold;
     bool operator>(const Grain& other) const { return threshold > other.threshold; }
     bool operator<(const Grain& other) const { return threshold < other.threshold; }
 };
 
-void precomputeHeatingMap(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y, double J_total) {
+void precomputeHeatingMap(double Tgrid[], PetscInt X, PetscInt Y, double J_total) {
     const double step_J = J_total / 4.0;
     std::vector<double> eff_T(X * Y);
     std::vector<bool> swapped(X * Y, false);
     std::priority_queue<Grain, std::vector<Grain>, std::greater<Grain>> pq;
-    for (SuiteSparse_long i = 0; i < X * Y; i++) {
+    for (PetscInt i = 0; i < X * Y; i++) {
         eff_T[i] = Tgrid[i];
         pq.push({i, eff_T[i]});
     }
@@ -111,8 +126,8 @@ void precomputeHeatingMap(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y
         swapped[top.idx] = true;
         current_max = std::max(current_max, top.threshold);
         Tgrid[top.idx] = current_max;
-        SuiteSparse_long r = top.idx / Y, c = top.idx % Y;
-        SuiteSparse_long neighbors[4] = { (r>0)?(r-1)*Y+c:-1, (r<X-1)?(r+1)*Y+c:-1, (c>0)?r*Y+(c-1):-1, (c<Y-1)?r*Y+(c+1):-1 };
+        PetscInt r = top.idx / Y, c = top.idx % Y;
+        PetscInt neighbors[4] = { (r>0)?(r-1)*Y+c:-1, (r<X-1)?(r+1)*Y+c:-1, (c>0)?r*Y+(c-1):-1, (c<Y-1)?r*Y+(c+1):-1 };
         for (int n = 0; n < 4; n++) {
             if (neighbors[n] != -1 && !swapped[neighbors[n]]) {
                 eff_T[neighbors[n]] -= step_J;
@@ -122,13 +137,13 @@ void precomputeHeatingMap(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y
     }
 }
 
-void precomputeCoolingMap(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y, double J_total) {
+void precomputeCoolingMap(double Tgrid[], PetscInt X, PetscInt Y, double J_total) {
     const double step_J = J_total / 4.0;
     std::vector<double> eff_T(X * Y);
     std::vector<bool> reverted(X * Y, false);
     std::priority_queue<Grain, std::vector<Grain>, std::less<Grain>> pq;
-    for (SuiteSparse_long i = 0; i < X * Y; i++) {
-        eff_T[i] = Tgrid[i] - J_total; 
+    for (PetscInt i = 0; i < X * Y; i++) {
+        eff_T[i] = Tgrid[i] - J_total;
         pq.push({i, eff_T[i]});
     }
     double current_min = 1e9;
@@ -139,8 +154,8 @@ void precomputeCoolingMap(double Tgrid[], SuiteSparse_long X, SuiteSparse_long Y
         if (current_min == 1e9) current_min = top.threshold;
         else current_min = std::min(current_min, top.threshold);
         Tgrid[top.idx] = current_min;
-        SuiteSparse_long r = top.idx / Y, c = top.idx % Y;
-        SuiteSparse_long neighbors[4] = { (r>0)?(r-1)*Y+c:-1, (r<X-1)?(r+1)*Y+c:-1, (c>0)?r*Y+(c-1):-1, (c<Y-1)?r*Y+(c+1):-1 };
+        PetscInt r = top.idx / Y, c = top.idx % Y;
+        PetscInt neighbors[4] = { (r>0)?(r-1)*Y+c:-1, (r<X-1)?(r+1)*Y+c:-1, (c>0)?r*Y+(c-1):-1, (c<Y-1)?r*Y+(c+1):-1 };
         for (int n = 0; n < 4; n++) {
             if (neighbors[n] != -1 && !reverted[neighbors[n]]) {
                 eff_T[neighbors[n]] += step_J;
@@ -164,17 +179,13 @@ std::set<int> generateHighlyBiasedTemps(double min_t, double max_t, double bias_
     return temps;
 }
 
-/**
- * Calculates the resistivity of the VO2 insulating phase based on 
- * semiconductor temperature dependence.
- */
 double getSemiconductorR(double T) {
-    // Parameters for VO2:
-    const double R_ref = 1000.0;  // Resistance at T_ref
-    const double T_ref = 300.0;   // Reference temperature (Kelvin)
-    const double alpha = 3500.0;  // Activation energy parameter (Ea / kB)
-
+    const double R_ref = 1000.0;
+    const double T_ref = 300.0;
+    const double alpha = 3500.0;
     return R_ref * std::exp(alpha * (1.0 / T - 1.0 / T_ref));
 }
+
+
 
 #endif
