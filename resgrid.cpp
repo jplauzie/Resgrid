@@ -31,16 +31,20 @@ static void print_elapsed(PetscMPIInt rank, const char* label,
 // Column indices are sorted within each row — required so that
 // PETSc's internal storage order matches our v_csr order,
 // enabling direct pointer writes for per-step value updates.
-// i_csr : row pointers,   length (local_rows + 1)
-// j_csr : column indices, length nnz_local
-// v_csr : values,         length nnz_local (filled per-step)
+// i_csr     : row pointers,   length (local_rows + 1)
+// j_csr     : column indices, length nnz_local
+// v_csr     : values,         length nnz_local (filled per-step)
+// col_to_idx: flat index into v_csr/j_csr for each (local_row, col)
+//             pair — built once here, used for O(1) lookups in
+//             fillCSRValues instead of a linear scan per entry.
 // ============================================================
 static void buildLocalCSR(
     PetscInt X, PetscInt Y,
     PetscInt r_start, PetscInt r_end,
     std::vector<PetscInt>& i_csr,
     std::vector<PetscInt>& j_csr,
-    std::vector<double>&   v_csr)
+    std::vector<double>&   v_csr,
+    std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)  // FIX 5: added col_to_idx
 {
     PetscInt local_rows = r_end - r_start;
     i_csr.resize(local_rows + 1);
@@ -81,10 +85,23 @@ static void buildLocalCSR(
     }
 
     v_csr.assign(j_csr.size(), 0.0);
+
+    // FIX 5: build col -> flat-index map for each local row.
+    // Stored as a sorted vector of (col, flat_idx) pairs so lookup
+    // is O(log d) where d <= 6 — effectively O(1) for this stencil.
+    col_to_idx.resize(local_rows);
+    for (PetscInt lr = 0; lr < local_rows; lr++) {
+        col_to_idx[lr].clear();
+        for (PetscInt k = i_csr[lr]; k < i_csr[lr + 1]; k++)
+            col_to_idx[lr].emplace_back(j_csr[k], k);
+        // Already sorted because j_csr is sorted within each row.
+    }
 }
 
 // ============================================================
 // Fill v_csr with conductance values for the current Rgrid.
+// FIX 5: uses col_to_idx for O(1) direct index writes instead
+// of the previous O(nnz_per_row) linear scan in set_val.
 // ============================================================
 static void fillCSRValues(
     PetscInt X, PetscInt Y,
@@ -92,18 +109,23 @@ static void fillCSRValues(
     const double* Rgrid,
     const std::vector<PetscInt>& i_csr,
     const std::vector<PetscInt>& j_csr,
-    std::vector<double>& v_csr)
+    std::vector<double>& v_csr,
+    const std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)  // FIX 5
 {
     std::fill(v_csr.begin(), v_csr.end(), 0.0);
 
     for (PetscInt r = r_start; r < r_end; r++) {
         PetscInt lr = r - r_start;
-        PetscInt rs = i_csr[lr];
 
+        // FIX 5: O(log d) lookup via lower_bound on the sorted
+        // (col, flat_idx) pairs — replaces the old O(d) linear scan.
         auto set_val = [&](PetscInt col, double val) {
-            for (PetscInt k = rs; k < i_csr[lr + 1]; k++) {
-                if (j_csr[k] == col) { v_csr[k] += val; return; }
-            }
+            auto it = std::lower_bound(
+                col_to_idx[lr].begin(), col_to_idx[lr].end(),
+                std::make_pair(col, (PetscInt)0),
+                [](const std::pair<PetscInt,PetscInt>& a,
+                   const std::pair<PetscInt,PetscInt>& b){ return a.first < b.first; });
+            v_csr[it->second] += val;
         };
 
         if (r == 0) {
@@ -169,7 +191,7 @@ int main(int argc, char **argv)
 
     if (rank == 0) printf("=== Initialization (nprocs=%d) ===\n", nprocs);
 
-    PetscInt X = 300, Y = 100;
+    PetscInt X = 100, Y = 100;
     PetscOptionsGetInt(NULL, NULL, "-X", &X, NULL);
     PetscOptionsGetInt(NULL, NULL, "-Y", &Y, NULL);
     if (rank == 0) printf("  Grid: %d x %d  (n = %d unknowns)\n",
@@ -194,21 +216,15 @@ int main(int argc, char **argv)
     print_elapsed(rank, "Heating/cooling cascades", t0, Clock::now());
 
     std::chrono::steady_clock::time_point end1 = std::chrono::steady_clock::now();
-	std::cout << "Time difference1 = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
+    std::cout << "Time difference1 = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
 
-    // -------------------------------------------------------------------
-    // MatCreate + MatSetUp: finalizes the parallel layout and gives us
-    // the ownership range WITHOUT allocating value storage.
-    // Then MatMPIAIJSetPreallocationCSR allocates exactly what is needed.
-    // This avoids the OOM from MatCreateAIJ(... Y+1 ...) on large grids.
-    // -------------------------------------------------------------------
     std::chrono::steady_clock::time_point begin2 = std::chrono::steady_clock::now();
     t0 = Clock::now();
     Mat A;
     MatCreate(PETSC_COMM_WORLD, &A);
     MatSetSizes(A, PETSC_DECIDE, PETSC_DECIDE, n, n);
     MatSetType(A, MATAIJ);
-    MatSetUp(A);  // finalizes layout, no value allocation yet
+    MatSetUp(A);
 
     PetscInt r_start, r_end;
     MatGetOwnershipRange(A, &r_start, &r_end);
@@ -217,18 +233,19 @@ int main(int argc, char **argv)
     t0 = Clock::now();
     std::vector<PetscInt> i_csr, j_csr;
     std::vector<double>   v_csr;
-    buildLocalCSR(X, Y, r_start, r_end, i_csr, j_csr, v_csr);
+    std::vector<std::vector<std::pair<PetscInt,PetscInt>>> col_to_idx;  // FIX 5
+    buildLocalCSR(X, Y, r_start, r_end, i_csr, j_csr, v_csr, col_to_idx);
     print_elapsed(rank, "Local CSR structure built", t0, Clock::now());
 
     t0 = Clock::now();
-    fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr);
+    fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
     MatMPIAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
     MatSeqAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
     MatSetOption(A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE);
     print_elapsed(rank, "CSR preallocation + initial fill", t0, Clock::now());
 
     std::chrono::steady_clock::time_point end2 = std::chrono::steady_clock::now();
-	std::cout << "Time difference2 = " << std::chrono::duration_cast<std::chrono::microseconds>(end2 - begin2).count() << "[micros]" << std::endl;
+    std::cout << "Time difference2 = " << std::chrono::duration_cast<std::chrono::microseconds>(end2 - begin2).count() << "[micros]" << std::endl;
 
     std::chrono::steady_clock::time_point begin3 = std::chrono::steady_clock::now();
     // --- Vectors ---
@@ -247,13 +264,20 @@ int main(int argc, char **argv)
     t0 = Clock::now();
     KSP ksp;
     KSPCreate(PETSC_COMM_WORLD, &ksp);
-    KSPSetOperators(ksp, A, A);
     KSPSetType(ksp, KSPGMRES);
     KSPGMRESSetRestart(ksp, 100);
     PC pc;
     KSPGetPC(ksp, &pc);
     PCSetType(pc, PCBJACOBI);
     KSPSetFromOptions(ksp);
+
+    // FIX 4: call KSPSetOperators once here, outside both loops.
+    // The sparsity pattern never changes — only values do — so there
+    // is no need to re-set operators every step. PETSc will use the
+    // same operator pointer and pick up updated values automatically
+    // after each MatAssemblyBegin/End inside reassemble().
+    KSPSetOperators(ksp, A, A);
+
     print_elapsed(rank, "KSP/PC setup", t0, Clock::now());
 
     if (rank == 0) {
@@ -262,30 +286,25 @@ int main(int argc, char **argv)
     }
 
     std::chrono::steady_clock::time_point end3 = std::chrono::steady_clock::now();
-	std::cout << "Time difference3 = " << std::chrono::duration_cast<std::chrono::microseconds>(end3 - begin3).count() << "[micros]" << std::endl;
+    std::cout << "Time difference3 = " << std::chrono::duration_cast<std::chrono::microseconds>(end3 - begin3).count() << "[micros]" << std::endl;
 
-    // -------------------------------------------------------------------
-    // Per-step reassembly: recompute v_csr then write directly into
-    // PETSc's internal value buffer via MatSeqAIJGetArray.
-    // No MatZeroEntries, no MatSetValue, no assembly begin/end.
-    // Safe because sparsity pattern is fixed and column order matches.
-    // -------------------------------------------------------------------
     std::chrono::steady_clock::time_point begin4 = std::chrono::steady_clock::now();
-    auto reassemble = [&]() {
-    fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr);
 
-    // Insert values row by row using precomputed CSR structure.
-    // MAT_NEW_NONZERO_ALLOCATION_ERR is set so no reallocation occurs —
-    // this is purely a value update into the existing sparsity pattern.
-    for (PetscInt lr = 0; lr < r_end - r_start; lr++) {
-        PetscInt r = r_start + lr;
-        PetscInt ncols = i_csr[lr + 1] - i_csr[lr];
-        const PetscInt* cols = j_csr.data() + i_csr[lr];
-        const double*   vals = v_csr.data() + i_csr[lr];
-        MatSetValues(A, 1, &r, ncols, cols, vals, INSERT_VALUES);
-    }
-    MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
-    MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
+    // FIX 5: pass col_to_idx through to fillCSRValues.
+    // FIX 4: removed KSPSetOperators from inside reassemble — it now
+    // lives outside the loop and is called exactly once (above).
+    auto reassemble = [&]() {
+        fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
+
+        for (PetscInt lr = 0; lr < r_end - r_start; lr++) {
+            PetscInt r = r_start + lr;
+            PetscInt ncols = i_csr[lr + 1] - i_csr[lr];
+            const PetscInt* cols = j_csr.data() + i_csr[lr];
+            const double*   vals = v_csr.data() + i_csr[lr];
+            MatSetValues(A, 1, &r, ncols, cols, vals, INSERT_VALUES);
+        }
+        MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
+        MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
     };
 
     double start_temp = 300.0, end_temp = 375.0;
@@ -310,8 +329,7 @@ int main(int argc, char **argv)
     size_t up_idx = 0;
 
     std::chrono::steady_clock::time_point end4 = std::chrono::steady_clock::now();
-	std::cout << "Time difference4 = " << std::chrono::duration_cast<std::chrono::microseconds>(end4 - begin4).count() << "[micros]" << std::endl;
-
+    std::cout << "Time difference4 = " << std::chrono::duration_cast<std::chrono::microseconds>(end4 - begin4).count() << "[micros]" << std::endl;
 
     // --- HEATING LOOP ---
     for (int step = 0; step <= total_steps; step++) {
@@ -327,7 +345,7 @@ int main(int argc, char **argv)
         auto t_asm = Clock::now();
         reassemble();
         auto t_slv = Clock::now();
-        KSPSetOperators(ksp, A, A);
+        // FIX 4: KSPSetOperators removed from here — called once at init.
         KSPSolve(ksp, b, x_vec);
         auto t_end = Clock::now();
 
@@ -339,7 +357,7 @@ int main(int argc, char **argv)
             fprintf(f1, "%f %f\n", temp, PetscRealPart(R_tot));
             if (up_idx < sched_up.size() && temp >= sched_up[up_idx]) {
                 //char fn[64]; sprintf(fn, "heat_%d.png", sched_up[up_idx]);
-               // save_rgrid_png(fn, Rgrid.get(), X, Y);
+                //save_rgrid_png(fn, Rgrid.get(), X, Y);
                 //up_idx++;
             }
             PetscInt its; KSPGetIterationNumber(ksp, &its);
@@ -350,8 +368,7 @@ int main(int argc, char **argv)
                 duration<double,std::milli>(t_end-s_start).count(), (int)its);
         }
         std::chrono::steady_clock::time_point end5 = std::chrono::steady_clock::now();
-	    std::cout << "Time difference5 = " << std::chrono::duration_cast<std::chrono::microseconds>(end5 - begin5).count() << "[micros]" << std::endl;
-
+        std::cout << "Time difference5 = " << std::chrono::duration_cast<std::chrono::microseconds>(end5 - begin5).count() << "[micros]" << std::endl;
     }
 
     if (rank == 0) { fclose(f1); printf("\n>>> STARTING COOLING CYCLE <<<\n"); }
@@ -369,7 +386,7 @@ int main(int argc, char **argv)
         auto t_asm = Clock::now();
         reassemble();
         auto t_slv = Clock::now();
-        KSPSetOperators(ksp, A, A);
+        // FIX 4: KSPSetOperators removed from here — called once at init.
         KSPSolve(ksp, b, x_vec);
         auto t_end = Clock::now();
 
