@@ -27,6 +27,115 @@ static void print_elapsed(PetscMPIInt rank, const char* label,
 }
 
 // ============================================================
+// Context for matrix-free matvec
+// ============================================================
+struct GridCtx {
+    const double* Rgrid;
+    PetscInt X, Y;
+    PetscInt r_start, r_end;  // local row ownership range
+};
+
+// ============================================================
+// Matrix-free matvec: y = A*x
+// Implements the same stencil as fillCSRValues but without
+// storing the matrix — only Rgrid is needed.
+// ============================================================
+static PetscErrorCode matvec(Mat M, Vec x, Vec y)
+{
+    GridCtx* ctx;
+    MatShellGetContext(M, (void**)&ctx);
+
+    const PetscInt X = ctx->X;
+    const PetscInt Y = ctx->Y;
+    const double*  R = ctx->Rgrid;
+
+    const PetscScalar* xarr;
+    PetscScalar*       yarr;
+
+    // We need the full x vector (including ghost entries from other ranks).
+    // VecGetArrayRead on the local portion only — for MPI we need a local
+    // scatter. Use a sequential workaround: get the full vector via VecScatter.
+    // For simplicity and correctness in MPI, use VecGetValues for off-rank
+    // entries. Since the stencil is very local (5-point + row 0), we instead
+    // work with the globally-accessible interface via nested Vecs.
+    //
+    // The cleanest MPI-correct approach: create a local form of x that
+    // includes ghost nodes. We do this by scattering x to a sequential Vec.
+    VecScatter scatter;
+    Vec x_seq;
+    VecScatterCreateToAll(x, &scatter, &x_seq);
+    VecScatterBegin(scatter, x, x_seq, INSERT_VALUES, SCATTER_FORWARD);
+    VecScatterEnd(scatter, x, x_seq, INSERT_VALUES, SCATTER_FORWARD);
+
+    VecGetArrayRead(x_seq, &xarr);
+    VecGetArray(y, &yarr);
+
+    PetscInt r_start = ctx->r_start;
+    PetscInt r_end   = ctx->r_end;
+
+    for (PetscInt r = r_start; r < r_end; r++) {
+        PetscInt lr = r - r_start;  // local row index into yarr
+
+        if (r == 0) {
+            // Source node row
+            double diag = 0.0;
+            double val  = 0.0;
+            for (PetscInt j = 0; j < Y; j++) {
+                double gval = 2.0 / R[j];
+                val  += -gval * xarr[j + 1];
+                diag += gval;
+            }
+            yarr[lr] = diag * xarr[0] + val;
+        } else {
+            PetscInt grid_idx = r - 1;
+            PetscInt i = grid_idx / Y;
+            PetscInt j = grid_idx % Y;
+            double diag = 0.0;
+            double val  = 0.0;
+
+            if (i == 0) {
+                double gval = 2.0 / R[grid_idx];
+                val  += -gval * xarr[0];
+                diag += gval;
+            } else {
+                double gval = g(R[grid_idx], R[(i-1)*Y+j]);
+                val  += -gval * xarr[r - Y];
+                diag += gval;
+            }
+
+            if (j > 0) {
+                double gval = g(R[grid_idx], R[i*Y+(j-1)]);
+                val  += -gval * xarr[r - 1];
+                diag += gval;
+            }
+
+            if (j < Y - 1) {
+                double gval = g(R[grid_idx], R[i*Y+(j+1)]);
+                val  += -gval * xarr[r + 1];
+                diag += gval;
+            }
+
+            if (i < X - 1) {
+                double gval = g(R[grid_idx], R[(i+1)*Y+j]);
+                val  += -gval * xarr[r + Y];
+                diag += gval;
+            } else {
+                diag += 2.0 / R[grid_idx];
+            }
+
+            yarr[lr] = diag * xarr[r] + val;
+        }
+    }
+
+    VecRestoreArrayRead(x_seq, &xarr);
+    VecRestoreArray(y, &yarr);
+    VecScatterDestroy(&scatter);
+    VecDestroy(&x_seq);
+
+    return 0;
+}
+
+// ============================================================
 // Build local CSR arrays for rows [r_start, r_end).
 // Column indices are sorted within each row — required so that
 // PETSc's internal storage order matches our v_csr order,
@@ -44,7 +153,7 @@ static void buildLocalCSR(
     std::vector<PetscInt>& i_csr,
     std::vector<PetscInt>& j_csr,
     std::vector<double>&   v_csr,
-    std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)  // FIX 5: added col_to_idx
+    std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)
 {
     PetscInt local_rows = r_end - r_start;
     i_csr.resize(local_rows + 1);
@@ -86,22 +195,16 @@ static void buildLocalCSR(
 
     v_csr.assign(j_csr.size(), 0.0);
 
-    // FIX 5: build col -> flat-index map for each local row.
-    // Stored as a sorted vector of (col, flat_idx) pairs so lookup
-    // is O(log d) where d <= 6 — effectively O(1) for this stencil.
     col_to_idx.resize(local_rows);
     for (PetscInt lr = 0; lr < local_rows; lr++) {
         col_to_idx[lr].clear();
         for (PetscInt k = i_csr[lr]; k < i_csr[lr + 1]; k++)
             col_to_idx[lr].emplace_back(j_csr[k], k);
-        // Already sorted because j_csr is sorted within each row.
     }
 }
 
 // ============================================================
 // Fill v_csr with conductance values for the current Rgrid.
-// FIX 5: uses col_to_idx for O(1) direct index writes instead
-// of the previous O(nnz_per_row) linear scan in set_val.
 // ============================================================
 static void fillCSRValues(
     PetscInt X, PetscInt Y,
@@ -110,15 +213,13 @@ static void fillCSRValues(
     const std::vector<PetscInt>& i_csr,
     const std::vector<PetscInt>& j_csr,
     std::vector<double>& v_csr,
-    const std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)  // FIX 5
+    const std::vector<std::vector<std::pair<PetscInt,PetscInt>>>& col_to_idx)
 {
     std::fill(v_csr.begin(), v_csr.end(), 0.0);
 
     for (PetscInt r = r_start; r < r_end; r++) {
         PetscInt lr = r - r_start;
 
-        // FIX 5: O(log d) lookup via lower_bound on the sorted
-        // (col, flat_idx) pairs — replaces the old O(d) linear scan.
         auto set_val = [&](PetscInt col, double val) {
             auto it = std::lower_bound(
                 col_to_idx[lr].begin(), col_to_idx[lr].end(),
@@ -191,13 +292,18 @@ int main(int argc, char **argv)
 
     if (rank == 0) printf("=== Initialization (nprocs=%d) ===\n", nprocs);
 
-    PetscInt X = 1000, Y = 1000;
+    PetscInt X = 100, Y = 100;
     PetscOptionsGetInt(NULL, NULL, "-X", &X, NULL);
     PetscOptionsGetInt(NULL, NULL, "-Y", &Y, NULL);
-    PetscBool save_pics = PETSC_FALSE;
-    PetscOptionsGetBool(NULL, NULL, "-save_pics", &save_pics, NULL);
     if (rank == 0) printf("  Grid: %d x %d  (n = %d unknowns)\n",
                           (int)X, (int)Y, (int)(X*Y+1));
+
+    // Flag to select matrix-free mode
+    PetscBool matrix_free = PETSC_FALSE;
+    PetscOptionsGetBool(NULL, NULL, "-matrix_free", &matrix_free, NULL);
+
+    PetscBool save_pics = PETSC_FALSE;
+    PetscOptionsGetBool(NULL, NULL, "-save_pics", &save_pics, NULL);
 
     const PetscInt n = X * Y + 1;
 
@@ -221,35 +327,73 @@ int main(int argc, char **argv)
     std::cout << "Time difference1 = " << std::chrono::duration_cast<std::chrono::microseconds>(end1 - begin1).count() << "[micros]" << std::endl;
 
     std::chrono::steady_clock::time_point begin2 = std::chrono::steady_clock::now();
-    t0 = Clock::now();
+
+    // --------------------------------------------------------
+    // Matrix setup — either assembled CSR or matrix-free shell
+    // --------------------------------------------------------
     Mat A;
-    MatCreate(PETSC_COMM_WORLD, &A);
-    MatSetSizes(A, PETSC_DECIDE, PETSC_DECIDE, n, n);
-    MatSetType(A, MATAIJ);
-    MatSetUp(A);
+    PetscInt r_start = 0, r_end = 0;
 
-    PetscInt r_start, r_end;
-    MatGetOwnershipRange(A, &r_start, &r_end);
-    print_elapsed(rank, "MatCreate + MatSetUp + ownership", t0, Clock::now());
-
-    t0 = Clock::now();
+    // These are only used in assembled mode
     std::vector<PetscInt> i_csr, j_csr;
     std::vector<double>   v_csr;
-    std::vector<std::vector<std::pair<PetscInt,PetscInt>>> col_to_idx;  // FIX 5
-    buildLocalCSR(X, Y, r_start, r_end, i_csr, j_csr, v_csr, col_to_idx);
-    print_elapsed(rank, "Local CSR structure built", t0, Clock::now());
+    std::vector<std::vector<std::pair<PetscInt,PetscInt>>> col_to_idx;
 
-    t0 = Clock::now();
-    fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
-    MatMPIAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
-    MatSeqAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
-    MatSetOption(A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE);
-    print_elapsed(rank, "CSR preallocation + initial fill", t0, Clock::now());
+    // GridCtx is only used in matrix-free mode
+    GridCtx ctx{Rgrid.get(), X, Y, 0, 0};
+
+    if (matrix_free) {
+        if (rank == 0) printf("  Mode: matrix-free (MatShell)\n");
+
+        // Determine local row ownership by mimicking PETSc's default layout
+        // We create a temporary dummy matrix just to get the ownership range,
+        // then destroy it. This ensures r_start/r_end match what PETSc would
+        // assign, which is needed for the matvec to write into the correct
+        // local portion of y.
+        Mat tmp;
+        MatCreate(PETSC_COMM_WORLD, &tmp);
+        MatSetSizes(tmp, PETSC_DECIDE, PETSC_DECIDE, n, n);
+        MatSetType(tmp, MATAIJ);
+        MatSetUp(tmp);
+        MatGetOwnershipRange(tmp, &r_start, &r_end);
+        MatDestroy(&tmp);
+
+        ctx.r_start = r_start;
+        ctx.r_end   = r_end;
+
+        PetscInt local_rows = r_end - r_start;
+        MatCreateShell(PETSC_COMM_WORLD, local_rows, local_rows, n, n, &ctx, &A);
+        MatShellSetOperation(A, MATOP_MULT, (void(*)(void))matvec);
+
+        print_elapsed(rank, "MatCreateShell", t0, Clock::now());
+    } else {
+        if (rank == 0) printf("  Mode: assembled CSR\n");
+
+        t0 = Clock::now();
+        MatCreate(PETSC_COMM_WORLD, &A);
+        MatSetSizes(A, PETSC_DECIDE, PETSC_DECIDE, n, n);
+        MatSetType(A, MATAIJ);
+        MatSetUp(A);
+        MatGetOwnershipRange(A, &r_start, &r_end);
+        print_elapsed(rank, "MatCreate + MatSetUp + ownership", t0, Clock::now());
+
+        t0 = Clock::now();
+        buildLocalCSR(X, Y, r_start, r_end, i_csr, j_csr, v_csr, col_to_idx);
+        print_elapsed(rank, "Local CSR structure built", t0, Clock::now());
+
+        t0 = Clock::now();
+        fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
+        MatMPIAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
+        MatSeqAIJSetPreallocationCSR(A, i_csr.data(), j_csr.data(), v_csr.data());
+        MatSetOption(A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE);
+        print_elapsed(rank, "CSR preallocation + initial fill", t0, Clock::now());
+    }
 
     std::chrono::steady_clock::time_point end2 = std::chrono::steady_clock::now();
     std::cout << "Time difference2 = " << std::chrono::duration_cast<std::chrono::microseconds>(end2 - begin2).count() << "[micros]" << std::endl;
 
     std::chrono::steady_clock::time_point begin3 = std::chrono::steady_clock::now();
+
     // --- Vectors ---
     t0 = Clock::now();
     Vec b, x_vec;
@@ -262,6 +406,48 @@ int main(int argc, char **argv)
     VecAssemblyBegin(b); VecAssemblyEnd(b);
     print_elapsed(rank, "Vectors", t0, Clock::now());
 
+    // --- Null space vector (allocated once, reused each step) ---
+    Vec nullvec;
+    MatCreateVecs(A, &nullvec, NULL);
+
+    std::vector<PetscInt>    ns_idx;
+    std::vector<PetscScalar> ns_vals;
+    ns_idx.reserve(X * Y);
+    ns_vals.reserve(X * Y);
+
+    auto buildMetallicNullSpace = [&]() {
+        ns_idx.clear();
+        ns_vals.clear();
+
+        for (PetscInt i = 0; i < X * Y; i++) {
+            if (Rgrid[i] < 2.0) {
+                ns_idx.push_back(i + 1);
+                ns_vals.push_back(1.0);
+            }
+        }
+
+        MatNullSpace ns;
+
+        if (ns_idx.size() > (size_t)(0.01 * X * Y)) {
+            VecSet(nullvec, 0.0);
+            VecSetValues(nullvec, ns_idx.size(), ns_idx.data(), ns_vals.data(), INSERT_VALUES);
+            VecAssemblyBegin(nullvec);
+            VecAssemblyEnd(nullvec);
+
+            PetscScalar norm;
+            VecNorm(nullvec, NORM_2, &norm);
+            VecScale(nullvec, 1.0 / norm);
+
+            MatNullSpaceCreate(PETSC_COMM_WORLD, PETSC_FALSE, 1, &nullvec, &ns);
+            MatSetNearNullSpace(A, ns);
+            MatNullSpaceDestroy(&ns);
+        } else {
+            MatNullSpaceCreate(PETSC_COMM_WORLD, PETSC_TRUE, 0, NULL, &ns);
+            MatSetNearNullSpace(A, ns);
+            MatNullSpaceDestroy(&ns);
+        }
+    };
+
     // --- KSP ---
     t0 = Clock::now();
     KSP ksp;
@@ -272,14 +458,7 @@ int main(int argc, char **argv)
     KSPGetPC(ksp, &pc);
     PCSetType(pc, PCBJACOBI);
     KSPSetFromOptions(ksp);
-
-    // FIX 4: call KSPSetOperators once here, outside both loops.
-    // The sparsity pattern never changes — only values do — so there
-    // is no need to re-set operators every step. PETSc will use the
-    // same operator pointer and pick up updated values automatically
-    // after each MatAssemblyBegin/End inside reassemble().
     KSPSetOperators(ksp, A, A);
-
     print_elapsed(rank, "KSP/PC setup", t0, Clock::now());
 
     if (rank == 0) {
@@ -292,23 +471,29 @@ int main(int argc, char **argv)
 
     std::chrono::steady_clock::time_point begin4 = std::chrono::steady_clock::now();
 
-    // FIX 5: pass col_to_idx through to fillCSRValues.
-    // FIX 4: removed KSPSetOperators from inside reassemble — it now
-    // lives outside the loop and is called exactly once (above).
+    // reassemble: updates matrix values each step.
+    // In matrix-free mode, Rgrid is already pointed to by ctx so no
+    // matrix assembly is needed — the matvec reads Rgrid directly.
+    // We still call buildMetallicNullSpace each step in both modes.
     auto reassemble = [&]() {
-        fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
+        if (!matrix_free) {
+            fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
 
-        for (PetscInt lr = 0; lr < r_end - r_start; lr++) {
-            PetscInt r = r_start + lr;
-            PetscInt ncols = i_csr[lr + 1] - i_csr[lr];
-            const PetscInt* cols = j_csr.data() + i_csr[lr];
-            const double*   vals = v_csr.data() + i_csr[lr];
-            MatSetValues(A, 1, &r, ncols, cols, vals, INSERT_VALUES);
+            for (PetscInt lr = 0; lr < r_end - r_start; lr++) {
+                PetscInt r = r_start + lr;
+                PetscInt ncols = i_csr[lr + 1] - i_csr[lr];
+                const PetscInt* cols = j_csr.data() + i_csr[lr];
+                const double*   vals = v_csr.data() + i_csr[lr];
+                MatSetValues(A, 1, &r, ncols, cols, vals, INSERT_VALUES);
+            }
+            MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
+            MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
         }
-        MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
-        MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
+        // In matrix-free mode: ctx.Rgrid points to Rgrid.get() which is
+        // already updated before reassemble() is called — nothing to do.
+
+        buildMetallicNullSpace();
     };
-    
 
     double start_temp = 300.0, end_temp = 375.0;
     int total_steps = (int)(end_temp - start_temp);
@@ -336,10 +521,9 @@ int main(int argc, char **argv)
 
     // --- HEATING LOOP ---
     for (int step = 0; step <= total_steps; step++) {
-        auto t_loop_start = Clock::now();  // add this
         std::cout << "Step " << step << " / " << total_steps << std::endl;
         std::chrono::steady_clock::time_point begin5 = std::chrono::steady_clock::now();
-        auto s_start = Clock::now();
+        auto t_loop_start = Clock::now();
         double temp = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
 
@@ -349,15 +533,8 @@ int main(int argc, char **argv)
         auto t_asm = Clock::now();
         reassemble();
         auto t_slv = Clock::now();
-        // FIX 4: KSPSetOperators removed from here — called once at init.
         KSPSolve(ksp, b, x_vec);
         auto t_end = Clock::now();
-
-        if (rank == 0)
-        printf("  rgrid:%.1fms  asm:%.1fms  slv:%.1fms\n",
-            duration<double,std::milli>(t_asm - t_loop_start).count(),
-            duration<double,std::milli>(t_slv - t_asm).count(),
-            duration<double,std::milli>(t_end - t_slv).count());
 
         PetscScalar R_tot = 0.0;
         if (r_start == 0) { PetscInt idx = 0; VecGetValues(x_vec, 1, &idx, &R_tot); }
@@ -371,11 +548,15 @@ int main(int argc, char **argv)
                 up_idx++;
             }
             PetscInt its; KSPGetIterationNumber(ksp, &its);
+            printf("  rgrid:%.1fms  asm:%.1fms  slv:%.1fms\n",
+                duration<double,std::milli>(t_asm - t_loop_start).count(),
+                duration<double,std::milli>(t_slv - t_asm).count(),
+                duration<double,std::milli>(t_end - t_slv).count());
             printf("Step %3d (H) | T:%.1f | R:%.4e | Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
                 step, temp, PetscRealPart(R_tot),
                 duration<double,std::milli>(t_slv-t_asm).count(),
                 duration<double,std::milli>(t_end-t_slv).count(),
-                duration<double,std::milli>(t_end-s_start).count(), (int)its);
+                duration<double,std::milli>(t_end-t_loop_start).count(), (int)its);
         }
         std::chrono::steady_clock::time_point end5 = std::chrono::steady_clock::now();
         std::cout << "Time difference5 = " << std::chrono::duration_cast<std::chrono::microseconds>(end5 - begin5).count() << "[micros]" << std::endl;
@@ -386,8 +567,7 @@ int main(int argc, char **argv)
 
     // --- COOLING LOOP ---
     for (int step = total_steps; step >= 0; step--) {
-        auto s_start = Clock::now();
-        std::cout << "Step " << step << " / " << total_steps << std::endl;
+        auto t_loop_start = Clock::now();
         double temp = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
 
@@ -397,7 +577,6 @@ int main(int argc, char **argv)
         auto t_asm = Clock::now();
         reassemble();
         auto t_slv = Clock::now();
-        // FIX 4: KSPSetOperators removed from here — called once at init.
         KSPSolve(ksp, b, x_vec);
         auto t_end = Clock::now();
 
@@ -417,12 +596,13 @@ int main(int argc, char **argv)
                 step, temp, PetscRealPart(R_tot),
                 duration<double,std::milli>(t_slv-t_asm).count(),
                 duration<double,std::milli>(t_end-t_slv).count(),
-                duration<double,std::milli>(t_end-s_start).count(), (int)its);
+                duration<double,std::milli>(t_end-t_loop_start).count(), (int)its);
         }
     }
 
     if (rank == 0) fclose(f2);
 
+    VecDestroy(&nullvec);
     KSPDestroy(&ksp);
     MatDestroy(&A);
     VecDestroy(&b);
