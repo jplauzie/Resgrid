@@ -178,7 +178,7 @@ static void fillCSRValues(
 int main(int argc, char **argv)
 {
     std::chrono::steady_clock::time_point begin1 = std::chrono::steady_clock::now();
-    _putenv_s("MKL_INTERFACE_LAYER", "ILP64");
+    _putenv_s("MKL_INTERFACE_LAYER", "LP64");
     _putenv_s("MKL_THREADING_LAYER", "INTEL");
     _putenv_s("MKL_NUM_THREADS", "1");
 
@@ -191,9 +191,11 @@ int main(int argc, char **argv)
 
     if (rank == 0) printf("=== Initialization (nprocs=%d) ===\n", nprocs);
 
-    PetscInt X = 100, Y = 100;
+    PetscInt X = 1000, Y = 1000;
     PetscOptionsGetInt(NULL, NULL, "-X", &X, NULL);
     PetscOptionsGetInt(NULL, NULL, "-Y", &Y, NULL);
+    PetscBool save_pics = PETSC_FALSE;
+    PetscOptionsGetBool(NULL, NULL, "-save_pics", &save_pics, NULL);
     if (rank == 0) printf("  Grid: %d x %d  (n = %d unknowns)\n",
                           (int)X, (int)Y, (int)(X*Y+1));
 
@@ -306,6 +308,7 @@ int main(int argc, char **argv)
         MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
         MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
     };
+    
 
     double start_temp = 300.0, end_temp = 375.0;
     int total_steps = (int)(end_temp - start_temp);
@@ -333,6 +336,7 @@ int main(int argc, char **argv)
 
     // --- HEATING LOOP ---
     for (int step = 0; step <= total_steps; step++) {
+        auto t_loop_start = Clock::now();  // add this
         std::cout << "Step " << step << " / " << total_steps << std::endl;
         std::chrono::steady_clock::time_point begin5 = std::chrono::steady_clock::now();
         auto s_start = Clock::now();
@@ -349,16 +353,22 @@ int main(int argc, char **argv)
         KSPSolve(ksp, b, x_vec);
         auto t_end = Clock::now();
 
+        if (rank == 0)
+        printf("  rgrid:%.1fms  asm:%.1fms  slv:%.1fms\n",
+            duration<double,std::milli>(t_asm - t_loop_start).count(),
+            duration<double,std::milli>(t_slv - t_asm).count(),
+            duration<double,std::milli>(t_end - t_slv).count());
+
         PetscScalar R_tot = 0.0;
         if (r_start == 0) { PetscInt idx = 0; VecGetValues(x_vec, 1, &idx, &R_tot); }
         MPI_Bcast(&R_tot, 1, MPI_DOUBLE, 0, PETSC_COMM_WORLD);
 
         if (rank == 0) {
             fprintf(f1, "%f %f\n", temp, PetscRealPart(R_tot));
-            if (up_idx < sched_up.size() && temp >= sched_up[up_idx]) {
-                //char fn[64]; sprintf(fn, "heat_%d.png", sched_up[up_idx]);
-                //save_rgrid_png(fn, Rgrid.get(), X, Y);
-                //up_idx++;
+            if (save_pics && up_idx < sched_up.size() && temp >= sched_up[up_idx]) {
+                char fn[64]; sprintf(fn, "heat_%d.png", sched_up[up_idx]);
+                save_rgrid_png(fn, Rgrid.get(), X, Y);
+                up_idx++;
             }
             PetscInt its; KSPGetIterationNumber(ksp, &its);
             printf("Step %3d (H) | T:%.1f | R:%.4e | Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
@@ -377,6 +387,7 @@ int main(int argc, char **argv)
     // --- COOLING LOOP ---
     for (int step = total_steps; step >= 0; step--) {
         auto s_start = Clock::now();
+        std::cout << "Step " << step << " / " << total_steps << std::endl;
         double temp = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
 
@@ -396,7 +407,7 @@ int main(int argc, char **argv)
 
         if (rank == 0) {
             fprintf(f2, "%f %f\n", temp, PetscRealPart(R_tot));
-            if (dn_idx < sched_down.size() && temp <= sched_down[dn_idx]) {
+            if (save_pics && dn_idx < sched_down.size() && temp <= sched_down[dn_idx]) {
                 char fn[64]; sprintf(fn, "cool_%d.png", (int)temp);
                 save_rgrid_png(fn, Rgrid.get(), X, Y);
                 dn_idx++;
