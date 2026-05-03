@@ -27,64 +27,108 @@ static void print_elapsed(PetscMPIInt rank, const char* label,
 }
 
 // ============================================================
-// Context for matrix-free matvec
+// Context for matrix-free matvec.
+//
+// Ghost vector strategy (replaces VecScatterCreateToAll):
+//   Instead of replicating the entire x vector on every rank,
+//   each rank only communicates the small number of entries it
+//   actually needs from neighbouring ranks:
+//     - one row above its owned range  (r_start - 1)
+//     - one row below its owned range  (r_end)
+//     - row 0 (source node), if not already owned
+//   This reduces per-matvec communication from O(n) to O(Y)
+//   (just one row of the grid), which is critical for large grids.
+//
+// ghost_indices: global indices of the ghost entries, in the order
+//   they appear in the ghost region of x_ghost.
+// x_ghost: VecGhost vector — local owned entries followed by ghosts.
+//   Owned portion maps directly to global rows [r_start, r_end).
+//   Ghost portion maps to ghost_indices[i] for ghost slot i.
 // ============================================================
 struct GridCtx {
     const double* Rgrid;
     PetscInt X, Y;
-    PetscInt r_start, r_end;  // local row ownership range
-    VecScatter scatter;
-    Vec x_seq;                // sequential copy of x, reused each matvec
+    PetscInt r_start, r_end;       // local row ownership range
+    Vec x_ghost;                   // ghost vector reused each matvec
+    std::vector<PetscInt> ghost_indices;   // ghost global indices (at most 3)
 };
+
+// Return the local index in the x_ghost array for a given global row.
+// Owned rows: local = global - r_start
+// Ghost rows: local = local_rows + ghost_slot
+// Ghost count is at most 3, so the linear scan is effectively O(1).
+static inline PetscInt globalToLocal(const GridCtx* ctx, PetscInt global)
+{
+    if (global >= ctx->r_start && global < ctx->r_end)
+        return global - ctx->r_start;
+
+    PetscInt local_rows = ctx->r_end - ctx->r_start;
+    for (PetscInt i = 0; i < (PetscInt)ctx->ghost_indices.size(); i++)
+        if (ctx->ghost_indices[i] == global)
+            return local_rows + i;
+
+    return -1;  // should never happen
+}
 
 // ============================================================
 // Matrix-free matvec: y = A*x
-// Implements the same stencil as fillCSRValues but without
-// storing the matrix — only Rgrid is needed.
+// Uses ghost vector to communicate only boundary rows.
 // ============================================================
 static PetscErrorCode matvec(Mat M, Vec x, Vec y)
 {
     GridCtx* ctx;
     MatShellGetContext(M, (void**)&ctx);
 
-    const PetscInt X = ctx->X;
-    const PetscInt Y = ctx->Y;
-    const double*  R = ctx->Rgrid;
+    const PetscInt X       = ctx->X;
+    const PetscInt Y       = ctx->Y;
+    const double*  R       = ctx->Rgrid;
+    const PetscInt r_start = ctx->r_start;
+    const PetscInt r_end   = ctx->r_end;
+    const PetscInt local_rows = r_end - r_start;
 
+    // Copy owned values from x into the local portion of x_ghost,
+    // then scatter ghost values from neighbouring ranks.
+    {
+        const PetscScalar* x_arr;
+        VecGetArrayRead(x, &x_arr);
+
+        Vec x_local;
+        VecGhostGetLocalForm(ctx->x_ghost, &x_local);
+        PetscScalar* ghost_arr;
+        VecGetArray(x_local, &ghost_arr);
+        for (PetscInt i = 0; i < local_rows; i++)
+            ghost_arr[i] = x_arr[i];
+        VecRestoreArray(x_local, &ghost_arr);
+        VecGhostRestoreLocalForm(ctx->x_ghost, &x_local);
+
+        VecRestoreArrayRead(x, &x_arr);
+    }
+
+    VecGhostUpdateBegin(ctx->x_ghost, INSERT_VALUES, SCATTER_FORWARD);
+    VecGhostUpdateEnd(ctx->x_ghost, INSERT_VALUES, SCATTER_FORWARD);
+
+    // Read from local+ghost array
+    Vec x_local;
+    VecGhostGetLocalForm(ctx->x_ghost, &x_local);
     const PetscScalar* xarr;
-    PetscScalar*       yarr;
+    VecGetArrayRead(x_local, &xarr);
 
-    // We need the full x vector (including ghost entries from other ranks).
-    // VecGetArrayRead on the local portion only — for MPI we need a local
-    // scatter. Use a sequential workaround: get the full vector via VecScatter.
-    // For simplicity and correctness in MPI, use VecGetValues for off-rank
-    // entries. Since the stencil is very local (5-point + row 0), we instead
-    // work with the globally-accessible interface via nested Vecs.
-    //
-    // The cleanest MPI-correct approach: create a local form of x that
-    // includes ghost nodes. We do this by scattering x to a sequential Vec.
-    VecScatterBegin(ctx->scatter, x, ctx->x_seq, INSERT_VALUES, SCATTER_FORWARD);
-    VecScatterEnd(ctx->scatter, x, ctx->x_seq, INSERT_VALUES, SCATTER_FORWARD);
-
-    VecGetArrayRead(ctx->x_seq, &xarr);
+    PetscScalar* yarr;
     VecGetArray(y, &yarr);
 
-    PetscInt r_start = ctx->r_start;
-    PetscInt r_end   = ctx->r_end;
-
     for (PetscInt r = r_start; r < r_end; r++) {
-        PetscInt lr = r - r_start;  // local row index into yarr
+        PetscInt lr = r - r_start;
 
         if (r == 0) {
-            // Source node row
             double diag = 0.0;
             double val  = 0.0;
             for (PetscInt j = 0; j < Y; j++) {
                 double gval = 2.0 / R[j];
-                val  += -gval * xarr[j + 1];
+                PetscInt lj = globalToLocal(ctx, j + 1);
+                val  += -gval * xarr[lj];
                 diag += gval;
             }
-            yarr[lr] = diag * xarr[0] + val;
+            yarr[lr] = diag * xarr[lr] + val;
         } else {
             PetscInt grid_idx = r - 1;
             PetscInt i = grid_idx / Y;
@@ -94,39 +138,45 @@ static PetscErrorCode matvec(Mat M, Vec x, Vec y)
 
             if (i == 0) {
                 double gval = 2.0 / R[grid_idx];
-                val  += -gval * xarr[0];
+                PetscInt l0 = globalToLocal(ctx, 0);
+                val  += -gval * xarr[l0];
                 diag += gval;
             } else {
                 double gval = g(R[grid_idx], R[(i-1)*Y+j]);
-                val  += -gval * xarr[r - Y];
+                PetscInt lup = globalToLocal(ctx, r - Y);
+                val  += -gval * xarr[lup];
                 diag += gval;
             }
 
             if (j > 0) {
                 double gval = g(R[grid_idx], R[i*Y+(j-1)]);
-                val  += -gval * xarr[r - 1];
+                PetscInt ll = globalToLocal(ctx, r - 1);
+                val  += -gval * xarr[ll];
                 diag += gval;
             }
 
             if (j < Y - 1) {
                 double gval = g(R[grid_idx], R[i*Y+(j+1)]);
-                val  += -gval * xarr[r + 1];
+                PetscInt lr2 = globalToLocal(ctx, r + 1);
+                val  += -gval * xarr[lr2];
                 diag += gval;
             }
 
             if (i < X - 1) {
                 double gval = g(R[grid_idx], R[(i+1)*Y+j]);
-                val  += -gval * xarr[r + Y];
+                PetscInt ldown = globalToLocal(ctx, r + Y);
+                val  += -gval * xarr[ldown];
                 diag += gval;
             } else {
                 diag += 2.0 / R[grid_idx];
             }
 
-            yarr[lr] = diag * xarr[r] + val;
+            yarr[lr] = diag * xarr[lr] + val;
         }
     }
 
-    VecRestoreArrayRead(ctx->x_seq, &xarr);
+    VecRestoreArrayRead(x_local, &xarr);
+    VecGhostRestoreLocalForm(ctx->x_ghost, &x_local);
     VecRestoreArray(y, &yarr);
 
     return 0;
@@ -134,7 +184,7 @@ static PetscErrorCode matvec(Mat M, Vec x, Vec y)
 
 // ============================================================
 // Matrix-free getdiagonal: extracts diagonal entries for Jacobi PC.
-// Same stencil as matvec but only accumulates diagonal values.
+// No communication needed — diagonal only depends on Rgrid.
 // ============================================================
 static PetscErrorCode getdiagonal(Mat M, Vec diag)
 {
@@ -179,16 +229,36 @@ static PetscErrorCode getdiagonal(Mat M, Vec diag)
 }
 
 // ============================================================
+// Build the ghost index list for a rank owning [r_start, r_end).
+// Returns sorted list of global indices needed from other ranks.
+// At most 3 entries: row above, row below, row 0.
+// ============================================================
+static std::vector<PetscInt> buildGhostIndices(
+    PetscInt n, PetscInt r_start, PetscInt r_end)
+{
+    std::vector<PetscInt> ghosts;
+    ghosts.reserve(3);
+
+    // Row above owned range
+    if (r_start > 1)
+        ghosts.push_back(r_start - 1);
+
+    // Row below owned range
+    if (r_end < n)
+        ghosts.push_back(r_end);
+
+    // Row 0 (source node) if not already owned
+    if (r_start > 0)
+        ghosts.push_back(0);
+
+    std::sort(ghosts.begin(), ghosts.end());
+    ghosts.erase(std::unique(ghosts.begin(), ghosts.end()), ghosts.end());
+
+    return ghosts;
+}
+
+// ============================================================
 // Build local CSR arrays for rows [r_start, r_end).
-// Column indices are sorted within each row — required so that
-// PETSc's internal storage order matches our v_csr order,
-// enabling direct pointer writes for per-step value updates.
-// i_csr     : row pointers,   length (local_rows + 1)
-// j_csr     : column indices, length nnz_local
-// v_csr     : values,         length nnz_local (filled per-step)
-// col_to_idx: flat index into v_csr/j_csr for each (local_row, col)
-//             pair — built once here, used for O(1) lookups in
-//             fillCSRValues instead of a linear scan per entry.
 // ============================================================
 static void buildLocalCSR(
     PetscInt X, PetscInt Y,
@@ -341,7 +411,6 @@ int main(int argc, char **argv)
     if (rank == 0) printf("  Grid: %d x %d  (n = %d unknowns)\n",
                           (int)X, (int)Y, (int)(X*Y+1));
 
-    // Flag to select matrix-free mode
     PetscBool matrix_free = PETSC_FALSE;
     PetscOptionsGetBool(NULL, NULL, "-matrix_free", &matrix_free, NULL);
 
@@ -371,28 +440,29 @@ int main(int argc, char **argv)
 
     std::chrono::steady_clock::time_point begin2 = std::chrono::steady_clock::now();
 
-    // --------------------------------------------------------
-    // Matrix setup — either assembled CSR or matrix-free shell
-    // --------------------------------------------------------
     Mat A;
     PetscInt r_start = 0, r_end = 0;
 
-    // These are only used in assembled mode
+    // Only used in assembled mode
     std::vector<PetscInt> i_csr, j_csr;
     std::vector<double>   v_csr;
     std::vector<std::vector<std::pair<PetscInt,PetscInt>>> col_to_idx;
 
-    // GridCtx is only used in matrix-free mode
-    GridCtx ctx{Rgrid.get(), X, Y, 0, 0, nullptr, nullptr};
+    // Only used in matrix-free mode
+    GridCtx ctx;
+    ctx.Rgrid   = Rgrid.get();
+    ctx.X       = X;
+    ctx.Y       = Y;
+    ctx.r_start = 0;
+    ctx.r_end   = 0;
+    ctx.x_ghost = nullptr;
 
     if (matrix_free) {
-        if (rank == 0) printf("  Mode: matrix-free (MatShell)\n");
+        if (rank == 0) printf("  Mode: matrix-free (MatShell + ghost vectors)\n");
 
-        // Determine local row ownership by mimicking PETSc's default layout
-        // We create a temporary dummy matrix just to get the ownership range,
-        // then destroy it. This ensures r_start/r_end match what PETSc would
-        // assign, which is needed for the matvec to write into the correct
-        // local portion of y.
+        t0 = Clock::now();
+
+        // Temporary matrix to get PETSc's default row distribution
         Mat tmp;
         MatCreate(PETSC_COMM_WORLD, &tmp);
         MatSetSizes(tmp, PETSC_DECIDE, PETSC_DECIDE, n, n);
@@ -404,19 +474,22 @@ int main(int argc, char **argv)
         ctx.r_start = r_start;
         ctx.r_end   = r_end;
 
+        // Build ghost index list — at most 3 entries per rank
+        ctx.ghost_indices = buildGhostIndices(n, r_start, r_end);
+
+        // Create ghost vector: owned [r_start,r_end) + ghost entries
         PetscInt local_rows = r_end - r_start;
+        VecCreateGhost(PETSC_COMM_WORLD,
+                       local_rows, n,
+                       (PetscInt)ctx.ghost_indices.size(),
+                       ctx.ghost_indices.data(),
+                       &ctx.x_ghost);
+
         MatCreateShell(PETSC_COMM_WORLD, local_rows, local_rows, n, n, &ctx, &A);
         MatShellSetOperation(A, MATOP_MULT,         (void(*)(void))matvec);
         MatShellSetOperation(A, MATOP_GET_DIAGONAL, (void(*)(void))getdiagonal);
 
-        // Create a scratch Vec and scatter for use in matvec — allocated
-        // once here and reused every matvec call to avoid per-call overhead.
-        Vec tmp_x;
-        MatCreateVecs(A, &tmp_x, NULL);
-        VecScatterCreateToAll(tmp_x, &ctx.scatter, &ctx.x_seq);
-        VecDestroy(&tmp_x);
-
-        print_elapsed(rank, "MatCreateShell", t0, Clock::now());
+        print_elapsed(rank, "MatCreateShell + ghost setup", t0, Clock::now());
     } else {
         if (rank == 0) printf("  Mode: assembled CSR\n");
 
@@ -485,10 +558,6 @@ int main(int argc, char **argv)
 
     std::chrono::steady_clock::time_point begin4 = std::chrono::steady_clock::now();
 
-    // reassemble: updates matrix values each step.
-    // In matrix-free mode, Rgrid is already pointed to by ctx so no
-    // matrix assembly is needed — the matvec reads Rgrid directly.
-    // We still call buildMetallicNullSpace each step in both modes.
     auto reassemble = [&]() {
         if (!matrix_free) {
             fillCSRValues(X, Y, r_start, r_end, Rgrid.get(), i_csr, j_csr, v_csr, col_to_idx);
@@ -503,9 +572,8 @@ int main(int argc, char **argv)
             MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY);
             MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY);
         }
-        // In matrix-free mode: ctx.Rgrid points to Rgrid.get() which is
-        // already updated before reassemble() is called — nothing to do.
-
+        // Matrix-free: ctx.Rgrid already points to Rgrid.get(),
+        // which is updated before reassemble() is called.
     };
 
     double start_temp = 300.0, end_temp = 375.0;
@@ -615,10 +683,9 @@ int main(int argc, char **argv)
 
     if (rank == 0) fclose(f2);
 
-    if (matrix_free) {
-        VecScatterDestroy(&ctx.scatter);
-        VecDestroy(&ctx.x_seq);
-    }
+    if (matrix_free && ctx.x_ghost)
+        VecDestroy(&ctx.x_ghost);
+
     KSPDestroy(&ksp);
     MatDestroy(&A);
     VecDestroy(&b);

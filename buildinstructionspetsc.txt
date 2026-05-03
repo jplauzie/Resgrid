@@ -1,3 +1,9 @@
 cl.exe /EHsc /I"C:\cygwin64\home\Josh\petsc\include" /I"C:\cygwin64\home\Josh\petsc\arch-mswin-c-debug\include" /I"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\include" resgrid.cpp /link /LIBPATH:"C:\cygwin64\home\Josh\petsc\arch-mswin-c-debug\lib" /LIBPATH:"C:\Program Files (x86)\IntelSWTools\compilers_and_libraries_2020.1.216\windows\mkl\lib\intel64" /LIBPATH:"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\lib\release" libpetsc.lib mkl_intel_lp64.lib mkl_sequential.lib mkl_core.lib impi.lib Ws2_32.lib Advapi32.lib Gdi32.lib User32.lib
 
 "C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\bin\mpiexec.exe" -n 1 resgrid.exe
+
+
+
+"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\bin\mpiexec.exe" -n 6 -genv I_MPI_PIN 1 -genv I_MPI_PIN_DOMAIN core resgrid.exe -matrix_free -ksp_type cg -pc_type jacobi -X 5000 -Y 5000 -ksp_rtol 1e-4
+
+cl.exe /EHsc /I"C:\cygwin64\home\Josh\petsc\include" /I"C:\cygwin64\home\Josh\petsc\arch-mswin-c-opt\include" /I"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\include" resgrid.cpp /link /LIBPATH:"C:\cygwin64\home\Josh\petsc\arch-mswin-c-opt\lib" /LIBPATH:"C:\Program Files (x86)\IntelSWTools\compilers_and_libraries_2020.1.216\windows\mkl\lib\intel64" /LIBPATH:"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\lib\release" libpetsc.lib mkl_intel_lp64.lib mkl_sequential.lib mkl_core.lib impi.lib Ws2_32.lib Advapi32.lib Gdi32.lib User32.lib
