@@ -902,3 +902,4 @@ int main(int argc, char **argv)
     return 0;
 }
 
+//fix cmdline:"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\bin\mpiexec.exe" -n 6 ./resgrid -X 500 -Y 500 -ksp_type fgmres -pc_type mg -pc_mg_cycle_type w -mg_levels_ksp_type cg -mg_levels_ksp_max_it 2 -mg_levels_pc_type jacobi -mg_coarse_ksp_type gmres -mg_coarse_ksp_max_it 500 -ksp_gmres_restart 100 -mg_coarse_ksp_rtol 1e-4 -ksp_rtol 1e-6 -ksp_monitor
