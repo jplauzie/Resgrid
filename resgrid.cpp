@@ -35,16 +35,37 @@ static inline double gmean(double R1, double R2)
 
 // ============================================================
 // Per-level context for matrix-free matvec.
-// Ghost vector has at most 3 entries (row above, row below,
-// row 0) — sufficient for the 5-point stencil matvec only.
-// Restriction/prolongation use separate VecScatterCreateToAll.
 // ============================================================
 struct LevelCtx {
     std::vector<double> Rgrid;
     PetscInt Xl, Yl, n;
     PetscInt r_start, r_end;
     Vec      x_ghost;
-    std::vector<PetscInt> ghost_indices;
+    
+    // NEW: Fast mapping offsets
+    PetscInt source_local_idx;
+    PetscInt above_halo_start_global;
+    PetscInt above_halo_start_local;
+    PetscInt below_halo_start_global;
+    PetscInt below_halo_start_local;
+};
+
+// ============================================================
+// Context for mapping between fine and coarse grids
+// ============================================================
+struct IntergridCtx {
+    LevelCtx* fine;
+    LevelCtx* coarse;
+
+    PetscInt fine_seq_offset;
+    PetscInt fine_seq_source_slot;
+    Vec fine_seq;
+    VecScatter fine_scatter;
+
+    PetscInt coarse_seq_offset;
+    PetscInt coarse_seq_ic_end;   // NEW: last ic row in coarse_seq (for bounds check)
+    Vec coarse_seq;
+    VecScatter coarse_scatter;
 };
 
 static std::vector<PetscInt> buildGhostIndices(
@@ -60,19 +81,17 @@ static std::vector<PetscInt> buildGhostIndices(
     return g;
 }
 
-static inline PetscInt globalToLocal(const LevelCtx* ctx, PetscInt global)
-{
+static inline PetscInt globalToLocal(const LevelCtx* ctx, PetscInt global) {
     if (global >= ctx->r_start && global < ctx->r_end)
-        return global - ctx->r_start;
-    PetscInt lr = ctx->r_end - ctx->r_start;
-    for (PetscInt i = 0; i < (PetscInt)ctx->ghost_indices.size(); i++)
-        if (ctx->ghost_indices[i] == global) return lr + i;
-    return -1;
+        return global - ctx->r_start; // Owned
+    if (global == 0) 
+        return ctx->source_local_idx; // Source node
+    if (global < ctx->r_start) 
+        return ctx->above_halo_start_local + (global - ctx->above_halo_start_global);
+    return ctx->below_halo_start_local + (global - ctx->below_halo_start_global);
 }
-
 // ============================================================
 // Matrix-free matvec: y = A*x
-// Uses the 3-entry ghost vector — correct for the 5-point stencil.
 // ============================================================
 static PetscErrorCode levelMatvec(Mat M, Vec x, Vec y)
 {
@@ -81,7 +100,7 @@ static PetscErrorCode levelMatvec(Mat M, Vec x, Vec y)
 
     const PetscInt  Xl      = ctx->Xl;
     const PetscInt  Yl      = ctx->Yl;
-    const double*   R       = ctx->Rgrid.data();
+    const double* R       = ctx->Rgrid.data();
     const PetscInt  r_start = ctx->r_start;
     const PetscInt  r_end   = ctx->r_end;
     const PetscInt  lrows   = r_end - r_start;
@@ -154,14 +173,14 @@ static PetscErrorCode levelMatvec(Mat M, Vec x, Vec y)
 }
 
 // ============================================================
-// Diagonal extraction for Jacobi sub-PC. No communication.
+// Diagonal extraction for Jacobi sub-PC.
 // ============================================================
 static PetscErrorCode levelGetDiagonal(Mat M, Vec diag)
 {
     LevelCtx* ctx;
     MatShellGetContext(M, (void**)&ctx);
     const PetscInt Xl = ctx->Xl, Yl = ctx->Yl;
-    const double*  R  = ctx->Rgrid.data();
+    const double* R  = ctx->Rgrid.data();
 
     PetscScalar* d; VecGetArray(diag, &d);
     for (PetscInt r = ctx->r_start; r < ctx->r_end; r++) {
@@ -187,8 +206,7 @@ static PetscErrorCode levelGetDiagonal(Mat M, Vec diag)
 }
 
 // ============================================================
-// Coarsen Rgrid 2x in both dims using harmonic mean.
-// Handles non-power-of-2 by clamping to last fine index.
+// Coarsen Rgrid 2x
 // ============================================================
 static std::vector<double> coarsenRgrid(
     const double* Rf, PetscInt Xf, PetscInt Yf,
@@ -219,68 +237,150 @@ static void getOwnershipRange(PetscInt n, PetscMPIInt rank, PetscMPIInt nprocs,
     re = rs + base + ((PetscInt)rank < extra ? 1 : 0);
 }
 
-static void buildGhostVec(LevelCtx& ctx, MPI_Comm comm)
-{
-    ctx.ghost_indices = buildGhostIndices(ctx.n, ctx.r_start, ctx.r_end);
+static void buildGhostVec(LevelCtx& ctx, MPI_Comm comm) {
+    std::vector<PetscInt> g;
+    // 1. Every rank can ghost the source node (index 0)
+    g.push_back(0);
+
+    // 2. Halo Above: Need Yl nodes to satisfy (r - Yl)
+    ctx.above_halo_start_global = std::max((PetscInt)1, ctx.r_start - ctx.Yl);
+    for (PetscInt i = ctx.above_halo_start_global; i < ctx.r_start; i++) {
+        if (i != 0) g.push_back(i);
+    }
+
+    // 3. Halo Below: Need Yl nodes to satisfy (r + Yl)
+    ctx.below_halo_start_global = ctx.r_end;
+    PetscInt below_halo_end = std::min(ctx.n, ctx.r_end + ctx.Yl);
+    for (PetscInt i = ctx.below_halo_start_global; i < below_halo_end; i++) {
+        g.push_back(i);
+    }
+
+    std::sort(g.begin(), g.end());
+    g.erase(std::unique(g.begin(), g.end()), g.end());
+    
     PetscInt lr = ctx.r_end - ctx.r_start;
-    VecCreateGhost(comm, lr, ctx.n,
-                   (PetscInt)ctx.ghost_indices.size(),
-                   ctx.ghost_indices.data(), &ctx.x_ghost);
+    // Set up O(1) mapping offsets
+    ctx.source_local_idx = -1;
+    ctx.above_halo_start_local = -1;
+    ctx.below_halo_start_local = -1;
+
+    for (size_t i = 0; i < g.size(); i++) {
+        if (g[i] == 0) ctx.source_local_idx = lr + i;
+        if (g[i] == ctx.above_halo_start_global) ctx.above_halo_start_local = lr + i;
+        if (g[i] == ctx.below_halo_start_global) ctx.below_halo_start_local = lr + i;
+    }
+
+    VecCreateGhost(comm, lr, ctx.n, (PetscInt)g.size(), g.data(), &ctx.x_ghost);
 }
 
 // ============================================================
-// Intergrid context for restriction and prolongation.
-//
-// Uses VecScatterCreateToAll for both fine and coarse vectors.
-// This is the key fix: the matvec ghost only has 3 entries and
-// cannot be reused for restriction which needs arbitrary rows.
-// VecScatterCreateToAll has simple O(n) setup with no IS analysis
-// and no risk of hanging.
-//
-// Memory cost: one full copy of fine vec per rank during restrict
-// (e.g. 500x500 = 2MB), one full copy of coarse vec during prolong.
-// Both are acceptable and much cheaper than the previous IS approach.
+// Intergrid context.
+// Both scatter operations now use ISCreateStride/General to 
+// prevent global broadcasts.
 // ============================================================
-struct IntergridCtx {
-    LevelCtx*  fine;
-    LevelCtx*  coarse;
-    VecScatter fine_scatter;    // replicates full fine vec locally
-    Vec        fine_seq;        // sequential fine vec on each rank
-    VecScatter coarse_scatter;  // replicates full coarse vec locally
-    Vec        coarse_seq;      // sequential coarse vec on each rank
-};
-
 static IntergridCtx* buildIntergridCtx(LevelCtx* fine, LevelCtx* coarse,
                                         MPI_Comm comm)
 {
-    auto* ig   = new IntergridCtx();
+    IntergridCtx* ig = new IntergridCtx();
     ig->fine   = fine;
     ig->coarse = coarse;
 
-    // Fine scatter: replicate entire fine vector on every rank.
-    // Used by restriction. VecScatterCreateToAll is O(n) setup,
-    // no IS analysis, no hang risk.
-    Vec fine_mpi;
-    VecCreateMPI(comm, fine->r_end - fine->r_start, fine->n, &fine_mpi);
-    VecScatterCreateToAll(fine_mpi, &ig->fine_scatter, &ig->fine_seq);
-    VecDestroy(&fine_mpi);
+    const PetscInt Yf = fine->Yl;
+    const PetscInt Yc = coarse->Yl;
 
-    // Coarse scatter: replicate entire coarse vector on every rank.
-    // Used by prolongation. Coarse is tiny (<=32x32+1=1025 entries).
-    Vec coarse_mpi;
-    VecCreateMPI(comm, coarse->r_end - coarse->r_start,
-                 coarse->n, &coarse_mpi);
-    VecScatterCreateToAll(coarse_mpi, &ig->coarse_scatter, &ig->coarse_seq);
-    VecDestroy(&coarse_mpi);
+    // --- FINE SCATTER (for restriction) ---
+    // Gather the band of fine rows covering owned coarse rows.
+    PetscInt ic_start = -1, ic_end = -1;
+    for (PetscInt rc = coarse->r_start; rc < coarse->r_end; rc++) {
+        if (rc == 0) continue;
+        PetscInt ic = (rc - 1) / Yc;
+        if (ic_start < 0) ic_start = ic;
+        ic_end = ic;
+    }
+
+    std::vector<PetscInt> indices;
+    indices.push_back(0);  // source node always needed
+
+    if (ic_start >= 0) {
+        PetscInt fi_start = 2 * ic_start;
+        PetscInt fi_end   = std::min(2 * ic_end + 1, fine->Xl - 1);
+        for (PetscInt fi = fi_start; fi <= fi_end; fi++)
+            for (PetscInt fj = 0; fj < Yf; fj++)
+                indices.push_back(fi * Yf + fj + 1);
+    }
+
+    ig->fine_seq_offset      = (ic_start >= 0) ? (2*ic_start)*Yf + 1 : 0;
+    ig->fine_seq_source_slot = 0;
+    PetscInt n_seq = (PetscInt)indices.size();
+
+    {
+        Vec fine_mpi;
+        VecCreateMPI(comm, fine->r_end - fine->r_start, fine->n, &fine_mpi);
+        IS from_is, to_is;
+        ISCreateGeneral(PETSC_COMM_SELF, n_seq, indices.data(),
+                        PETSC_COPY_VALUES, &from_is);
+        ISCreateStride(PETSC_COMM_SELF, n_seq, 0, 1, &to_is);
+        VecCreateSeq(PETSC_COMM_SELF, n_seq, &ig->fine_seq);
+        VecScatterCreate(fine_mpi, from_is, ig->fine_seq, to_is,
+                         &ig->fine_scatter);
+        ISDestroy(&from_is);
+        ISDestroy(&to_is);
+        VecDestroy(&fine_mpi);
+    }
+
+    // --- COARSE SCATTER (for prolongation) ---
+    // Find which coarse ic rows this rank needs for its owned fine rows.
+    // Bilinear interpolation means a fine node at ic row needs coarse
+    // rows ic/2 AND ic/2+1, so we extend the upper end by 1.
+    PetscInt ic_start_prol = -1, ic_end_prol = -1;
+    for (PetscInt rf = fine->r_start; rf < fine->r_end; rf++) {
+        if (rf == 0) continue;
+        PetscInt gf  = rf - 1;
+        PetscInt iff = gf / Yf;
+        PetscInt ic  = iff / 2;
+        if (ic_start_prol < 0) ic_start_prol = ic;
+        ic_end_prol = ic;
+    }
+
+    // Extend by 1 to cover the ic+1 neighbor in bilinear weights.
+    // Clamp to the actual coarse grid boundary.
+    if (ic_end_prol >= 0)
+        ic_end_prol = std::min(ic_end_prol + 1, coarse->Xl - 1);
+
+    ig->coarse_seq_offset = (ic_start_prol >= 0) ? ic_start_prol * Yc + 1 : 0;
+    ig->coarse_seq_ic_end = ic_end_prol;  // store for bounds check in prolongVec
+
+    std::vector<PetscInt> c_indices;
+    c_indices.push_back(0);  // source node always needed
+    if (ic_start_prol >= 0) {
+        for (PetscInt ic = ic_start_prol; ic <= ic_end_prol; ic++)
+            for (PetscInt jc = 0; jc < Yc; jc++)
+                c_indices.push_back(ic * Yc + jc + 1);
+    }
+
+    PetscInt n_seq_c = (PetscInt)c_indices.size();
+
+    {
+        Vec coarse_mpi;
+        VecCreateMPI(comm, coarse->r_end - coarse->r_start,
+                     coarse->n, &coarse_mpi);
+        IS from_is_c, to_is_c;
+        ISCreateGeneral(PETSC_COMM_SELF, n_seq_c, c_indices.data(),
+                        PETSC_COPY_VALUES, &from_is_c);
+        ISCreateStride(PETSC_COMM_SELF, n_seq_c, 0, 1, &to_is_c);
+        VecCreateSeq(PETSC_COMM_SELF, n_seq_c, &ig->coarse_seq);
+        VecScatterCreate(coarse_mpi, from_is_c, ig->coarse_seq, to_is_c,
+                         &ig->coarse_scatter);
+        ISDestroy(&from_is_c);
+        ISDestroy(&to_is_c);
+        VecDestroy(&coarse_mpi);
+    }
 
     return ig;
 }
 
 // ============================================================
 // Restriction: xc = R * xf
-// Replicates full fine vec, then each rank fills its owned
-// coarse rows by averaging the 2x2 fine block.
-// Direct array indexing — no ghost lookup, no binary search.
 // ============================================================
 static PetscErrorCode restrictVec(Mat Rmat, Vec xf, Vec xc)
 {
@@ -289,41 +389,37 @@ static PetscErrorCode restrictVec(Mat Rmat, Vec xf, Vec xc)
     LevelCtx* fine   = ig->fine;
     LevelCtx* coarse = ig->coarse;
 
-    // Scatter full fine vector to local sequential copy.
-    VecScatterBegin(ig->fine_scatter, xf, ig->fine_seq,
-                    INSERT_VALUES, SCATTER_FORWARD);
-    VecScatterEnd  (ig->fine_scatter, xf, ig->fine_seq,
-                    INSERT_VALUES, SCATTER_FORWARD);
+    VecScatterBegin(ig->fine_scatter, xf, ig->fine_seq, INSERT_VALUES, SCATTER_FORWARD);
+    VecScatterEnd  (ig->fine_scatter, xf, ig->fine_seq, INSERT_VALUES, SCATTER_FORWARD);
 
     const PetscScalar* fseq; VecGetArrayRead(ig->fine_seq, &fseq);
-    PetscScalar*       xca;  VecGetArray(xc, &xca);
+    PetscScalar* xca;  VecGetArray(xc, &xca);
 
     const PetscInt Yf = fine->Yl, Yc = coarse->Yl;
+
+    auto fget = [&](PetscInt gi) -> PetscScalar {
+        if (gi == 0) return fseq[0];
+        return fseq[gi - ig->fine_seq_offset + 1];
+    };
 
     for (PetscInt rc = coarse->r_start; rc < coarse->r_end; rc++) {
         PetscInt lc = rc - coarse->r_start;
         if (rc == 0) {
-            // Source node: direct injection.
-            // fseq[0] is global index 0 (source node).
             xca[lc] = fseq[0];
         } else {
             PetscInt gc = rc - 1;
             PetscInt ic = gc / Yc, jc = gc % Yc;
             PetscInt if0=2*ic, if1=std::min(2*ic+1, fine->Xl-1);
             PetscInt jf0=2*jc, jf1=std::min(2*jc+1, Yf-1);
-
-            // Full-weighting average over 2x2 fine block.
-            // fseq global index of fine grain (i,j) = i*Yf + j + 1
-            // (+1 because global index 0 is the source node).
-            int cnt = 0; PetscScalar sum = 0.0;
-            auto acc = [&](PetscInt ri, PetscInt rj) {
-                sum += fseq[ri*Yf + rj + 1]; cnt++;
+            int cnt=0; PetscScalar sum=0.0;
+            auto acc=[&](PetscInt ri, PetscInt rj){
+                sum += fget(ri*Yf + rj + 1); cnt++;
             };
-            acc(if0, jf0);
-            if (jf1 != jf0) acc(if0, jf1);
-            if (if1 != if0) acc(if1, jf0);
-            if (if1 != if0 && jf1 != jf0) acc(if1, jf1);
-            xca[lc] = sum / (PetscScalar)cnt;
+            acc(if0,jf0);
+            if (jf1!=jf0) acc(if0,jf1);
+            if (if1!=if0) acc(if1,jf0);
+            if (if1!=if0&&jf1!=jf0) acc(if1,jf1);
+            xca[lc] = sum/(PetscScalar)cnt;
         }
     }
 
@@ -334,8 +430,6 @@ static PetscErrorCode restrictVec(Mat Rmat, Vec xf, Vec xc)
 
 // ============================================================
 // Prolongation: xf = P * xc
-// Replicates full coarse vec, then each rank fills its owned
-// fine rows by injecting the enclosing coarse node's value.
 // ============================================================
 static PetscErrorCode prolongVec(Mat Pmat, Vec xc, Vec xf)
 {
@@ -344,7 +438,6 @@ static PetscErrorCode prolongVec(Mat Pmat, Vec xc, Vec xf)
     LevelCtx* fine   = ig->fine;
     LevelCtx* coarse = ig->coarse;
 
-    // Replicate full coarse vector locally — cheap (<=1025 entries).
     VecScatterBegin(ig->coarse_scatter, xc, ig->coarse_seq,
                     INSERT_VALUES, SCATTER_FORWARD);
     VecScatterEnd  (ig->coarse_scatter, xc, ig->coarse_seq,
@@ -355,20 +448,66 @@ static PetscErrorCode prolongVec(Mat Pmat, Vec xc, Vec xf)
 
     const PetscInt Yf = fine->Yl, Yc = coarse->Yl;
 
+    // Map coarse global index -> cseq slot.
+    // gi==0: source node at slot 0.
+    // gi>=1: slot = 1 + (gi - coarse_seq_offset)
+    auto cget = [&](PetscInt gi) -> PetscScalar {
+        if (gi == 0) return cseq[0];
+        return cseq[1 + (gi - ig->coarse_seq_offset)];
+    };
+
     for (PetscInt rf = fine->r_start; rf < fine->r_end; rf++) {
         PetscInt lf = rf - fine->r_start;
+
         if (rf == 0) {
-            // Source node: direct injection from coarse source.
+            // Source node: direct injection, no spatial position.
             xfa[lf] = cseq[0];
-        } else {
-            PetscInt gf  = rf - 1;
-            PetscInt iff = gf / Yf, jf = gf % Yf;
-            PetscInt ic  = iff / 2, jc = jf / 2;
-            if (ic >= coarse->Xl) ic = coarse->Xl - 1;
-            if (jc >= coarse->Yl) jc = coarse->Yl - 1;
-            // cseq index: 0=source, grain (ic,jc) = ic*Yc+jc+1
-            xfa[lf] = cseq[ic * Yc + jc + 1];
+            continue;
         }
+
+        PetscInt gf  = rf - 1;
+        PetscInt iff = gf / Yf;   // fine grid row index
+        PetscInt jf  = gf % Yf;   // fine grid col index
+
+        // Coarse cell this fine node lives in.
+        PetscInt ic = iff / 2;
+        PetscInt jc = jf  / 2;
+
+        // Bilinear weights in i (row) direction.
+        // Even iff: fine node coincides with coarse row ic.
+        //   -> all weight on ic, none on ic+1.
+        // Odd iff: fine node is halfway between coarse rows ic and ic+1.
+        //   -> equal weight on both.
+        double wi0, wi1;
+        if (iff % 2 == 0) { wi0 = 1.0; wi1 = 0.0; }
+        else               { wi0 = 0.5; wi1 = 0.5; }
+
+        // Bilinear weights in j (col) direction. Same logic.
+        double wj0, wj1;
+        if (jf % 2 == 0) { wj0 = 1.0; wj1 = 0.0; }
+        else              { wj0 = 0.5; wj1 = 0.5; }
+
+        // Neighbouring coarse rows/cols, clamped to grid boundary.
+        // At boundaries the fine node has no neighbour beyond the edge,
+        // so the weight naturally falls entirely on the boundary coarse node
+        // (wi1/wj1 == 0 whenever iff/jf is even, which it always is at the
+        // boundary for a 2x coarsening). The clamp is a safety net for
+        // non-power-of-2 grids where the last fine row may be odd.
+        PetscInt ic1 = std::min(ic + 1, coarse->Xl - 1);
+        PetscInt jc1 = std::min(jc + 1, coarse->Yl - 1);
+
+        // Compute the 4 coarse global indices.
+        // Coarse global index of grain (ic, jc) = ic*Yc + jc + 1
+        // (+1 for source node offset).
+        PetscInt g00 = ic  * Yc + jc  + 1;
+        PetscInt g01 = ic  * Yc + jc1 + 1;
+        PetscInt g10 = ic1 * Yc + jc  + 1;
+        PetscInt g11 = ic1 * Yc + jc1 + 1;
+
+        xfa[lf] = wi0*wj0 * cget(g00)
+                + wi0*wj1 * cget(g01)
+                + wi1*wj0 * cget(g10)
+                + wi1*wj1 * cget(g11);
     }
 
     VecRestoreArrayRead(ig->coarse_seq, &cseq);
@@ -478,10 +617,6 @@ static PetscErrorCode setupPCMG(PC pc, MGData& mg,
     setup.P_mats.resize(nlevels - 1, nullptr);
     print_elapsed(0, "first", PCMGstart, Clock::now());
 
-    // PETSc PCMG level convention: 0=coarsest, nlevels-1=finest.
-    // Our MGData convention:        0=finest,   nlevels-1=coarsest.
-    // Mapping: pcmg_lv = (nlevels-1) - our_lv
-
     for (int lv = 0; lv < nlevels; lv++) {
         int pcmg_lv = (nlevels-1) - lv;
         PCMGSetOperators(pc, pcmg_lv,
@@ -490,7 +625,7 @@ static PetscErrorCode setupPCMG(PC pc, MGData& mg,
     print_elapsed(0, "second", PCMGstart, Clock::now());
 
     for (int lv = 0; lv < nlevels-1; lv++) {
-        int pcmg_fine = (nlevels-1) - lv;  // PCMG index of the fine level
+        int pcmg_fine = (nlevels-1) - lv; 
 
         LevelCtx* fine_ctx   = &mg.levels[lv].ctx;
         LevelCtx* coarse_ctx = &mg.levels[lv+1].ctx;
@@ -501,12 +636,10 @@ static PetscErrorCode setupPCMG(PC pc, MGData& mg,
         PetscInt nf=fine_ctx->n,   lf=fine_ctx->r_end   - fine_ctx->r_start;
         PetscInt nc=coarse_ctx->n, lc=coarse_ctx->r_end  - coarse_ctx->r_start;
 
-        // Restriction shell: fine -> coarse  (lc rows, lf cols)
         MatCreateShell(comm, lc, lf, nc, nf, ig, &setup.R_mats[lv]);
         MatShellSetOperation(setup.R_mats[lv], MATOP_MULT,
                              (void(*)(void))restrictVec);
 
-        // Prolongation shell: coarse -> fine  (lf rows, lc cols)
         MatCreateShell(comm, lf, lc, nf, nc, ig, &setup.P_mats[lv]);
         MatShellSetOperation(setup.P_mats[lv], MATOP_MULT,
                              (void(*)(void))prolongVec);
@@ -516,7 +649,7 @@ static PetscErrorCode setupPCMG(PC pc, MGData& mg,
     }
     print_elapsed(0, "third", PCMGstart, Clock::now());
 
-    // Smoothers on all non-coarsest levels (pcmg levels 1..nlevels-1).
+    // Keeping your previous smoother setups but allowing command line to override
     for (int pcmg_lv = 1; pcmg_lv < nlevels; pcmg_lv++) {
         KSP smoother;
         PCMGGetSmoother(pc, pcmg_lv, &smoother);
@@ -525,16 +658,12 @@ static PetscErrorCode setupPCMG(PC pc, MGData& mg,
         PCSetType(sub_pc, PCJACOBI);
         KSPSetTolerances(smoother, PETSC_DEFAULT, PETSC_DEFAULT,
                          PETSC_DEFAULT, 2);
-        // Inflate upper eigenvalue bound 30% — safe overestimate.
-        // Prevents indefinite-preconditioner failure near the transition
-        // where the spectrum shifts rapidly. Slight weakening of smoother
-        // is acceptable; underestimate would break outer CG.
         KSPChebyshevEstEigSet(smoother, 0.0, 0.1, 0.0, 1.3);
         KSPChebyshevEstEigSetUseNoisy(smoother, PETSC_TRUE);
     }
     print_elapsed(0, "fourth", PCMGstart, Clock::now());
 
-    // Coarsest level (pcmg level 0): iterative solve, no explicit matrix.
+    // Coarsest level
     {
         KSP coarse_ksp;
         PCMGGetCoarseSolve(pc, &coarse_ksp);
@@ -664,7 +793,7 @@ int main(int argc, char **argv)
     }
 
     size_t up_idx = 0;
-    for (int step = 0; step <= total_steps; step++) {
+    for (int step = 0; step <= total_steps; step+=10) {
         auto t_loop_start = Clock::now();
         double temp  = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
@@ -705,7 +834,7 @@ int main(int argc, char **argv)
     if (rank == 0) { fclose(f1); printf("\n>>> STARTING COOLING CYCLE <<<\n"); }
     size_t dn_idx = 0;
 
-    for (int step = total_steps; step >= 0; step--) {
+    for (int step = total_steps; step >= 0; step-=10) {
         auto t_loop_start = Clock::now();
         double temp  = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
@@ -745,10 +874,9 @@ int main(int argc, char **argv)
         }
     }
 
-    // ---- Cleanup ---- (must all happen before PetscFinalize)
+    // ---- Cleanup ----
     if (rank == 0) fclose(f2);
 
-    // Destroy intergrid contexts and their mats explicitly
     for (int lv = 0; lv < mg.nlevels - 1; lv++) {
         MatDestroy(&mg_setup.R_mats[lv]);
         MatDestroy(&mg_setup.P_mats[lv]);
@@ -770,6 +898,7 @@ int main(int argc, char **argv)
     KSPDestroy(&ksp);
     VecDestroy(&b);
     VecDestroy(&x_vec);
-    PetscFinalize();   // now nothing PETSc-owned survives past this
+    PetscFinalize();
     return 0;
 }
+
