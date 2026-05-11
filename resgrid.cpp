@@ -1,6 +1,8 @@
 #include <petscksp.h>
 #include <petscmat.h>
 #include <petscpc.h>
+#include <petscvec.h>
+#include <mpi.h>
 #include <vector>
 #include <memory>
 #include <chrono>
@@ -9,211 +11,163 @@
 #include <cmath>
 #include <stdio.h>
 #include <iostream>
-#include "Header.h"
+#include "header.h"
 #include "visualization.h"
+#include "resgrid_kernels.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 using namespace std::chrono;
 using Clock = high_resolution_clock;
-using std::cout;
-using std::endl;
 
-static void print_elapsed(PetscMPIInt rank, const char* label,
-                          time_point<Clock> t0, time_point<Clock> t1)
-{
-    if (rank == 0)
-        printf("  [init] %-45s %.1f ms\n", label,
-               duration<double, std::milli>(t1 - t0).count());
+static void print_elapsed(PetscMPIInt rank, const char* label, time_point<Clock> t0, time_point<Clock> t1) {
+    if (rank == 0) printf("  [init] %-45s %.1f ms\n", label, duration<double, std::milli>(t1 - t0).count());
 }
 
-static inline double gmean(double R1, double R2)
-{
-    return 2.0 / (R1 + R2);
-}
+struct GhostExchange {
+    struct RecvSeg { int rank; PetscInt local_start; PetscInt count; };
+    struct SendSeg { int rank; PetscInt count; double* d_buf; std::vector<int> local_indices; int* d_indices; };
+    struct SelfCopy { PetscInt src; PetscInt dst; };
+    std::vector<RecvSeg> recvs;
+    std::vector<SendSeg> sends;
+    std::vector<SelfCopy> self_copies;
+    std::vector<MPI_Request> reqs;
+    MPI_Comm comm;
+    int tag = 42;
+};
 
-// ============================================================
-// Per-level context for matrix-free matvec.
-// ============================================================
 struct LevelCtx {
     std::vector<double> Rgrid;
     PetscInt Xl, Yl, n;
     PetscInt r_start, r_end;
-    Vec      x_ghost;
-    
-    // NEW: Fast mapping offsets
     PetscInt source_local_idx;
     PetscInt above_halo_start_global;
     PetscInt above_halo_start_local;
     PetscInt below_halo_start_global;
     PetscInt below_halo_start_local;
+    double* d_R      = nullptr; 
+    double* d_xlocal = nullptr;   
+    double* d_y      = nullptr;   
+    PetscInt xlocal_total = 0;
+    GhostExchange ghost_ex;
+    Vec x_ghost_host;
 };
 
-// ============================================================
-// Context for mapping between fine and coarse grids
-// ============================================================
 struct IntergridCtx {
     LevelCtx* fine;
     LevelCtx* coarse;
-
     PetscInt fine_seq_offset;
     PetscInt fine_seq_source_slot;
     Vec fine_seq;
     VecScatter fine_scatter;
-
     PetscInt coarse_seq_offset;
-    PetscInt coarse_seq_ic_end;   // NEW: last ic row in coarse_seq (for bounds check)
+    PetscInt coarse_seq_ic_end;
     Vec coarse_seq;
     VecScatter coarse_scatter;
 };
 
-static std::vector<PetscInt> buildGhostIndices(
-    PetscInt n, PetscInt r_start, PetscInt r_end)
-{
-    std::vector<PetscInt> g;
-    g.reserve(3);
-    if (r_start > 1) g.push_back(r_start - 1);
-    if (r_end   < n) g.push_back(r_end);
-    if (r_start > 0) g.push_back(0);
-    std::sort(g.begin(), g.end());
-    g.erase(std::unique(g.begin(), g.end()), g.end());
-    return g;
+static void buildGhostExchange(LevelCtx& ctx, const std::vector<PetscInt>& ghost_globals, MPI_Comm comm) {
+    PetscMPIInt nprocs, rank;
+    MPI_Comm_size(comm, &nprocs);
+    MPI_Comm_rank(comm, &rank);
+    if (nprocs == 1) return; 
+
+    GhostExchange& gx = ctx.ghost_ex;
+    gx.comm = comm; gx.tag  = 42;
 }
 
-static inline PetscInt globalToLocal(const LevelCtx* ctx, PetscInt global) {
-    if (global >= ctx->r_start && global < ctx->r_end)
-        return global - ctx->r_start; // Owned
-    if (global == 0) 
-        return ctx->source_local_idx; // Source node
-    if (global < ctx->r_start) 
-        return ctx->above_halo_start_local + (global - ctx->above_halo_start_global);
-    return ctx->below_halo_start_local + (global - ctx->below_halo_start_global);
+static void ghostExchangeExecute(LevelCtx& ctx) {
+    PetscMPIInt nprocs; MPI_Comm_size(ctx.ghost_ex.comm, &nprocs);
+    if (nprocs == 1) return; 
+    GhostExchange& gx = ctx.ghost_ex;
+    for (auto& sc : gx.self_copies) cuda_memcpy_device_to_device(ctx.d_xlocal + sc.dst, ctx.d_xlocal + sc.src, sizeof(double));
+    if (gx.reqs.empty()) return;
+    for (auto& seg : gx.sends) launch_gather(seg.d_buf, ctx.d_xlocal, seg.d_indices, (int)seg.count);
+    MPI_Startall((int)gx.reqs.size(), gx.reqs.data());
+    MPI_Waitall((int)gx.reqs.size(), gx.reqs.data(), MPI_STATUSES_IGNORE);
 }
-// ============================================================
-// Matrix-free matvec: y = A*x
-// ============================================================
-static PetscErrorCode levelMatvec(Mat M, Vec x, Vec y)
-{
-    LevelCtx* ctx;
-    MatShellGetContext(M, (void**)&ctx);
 
-    const PetscInt  Xl      = ctx->Xl;
-    const PetscInt  Yl      = ctx->Yl;
-    const double* R       = ctx->Rgrid.data();
-    const PetscInt  r_start = ctx->r_start;
-    const PetscInt  r_end   = ctx->r_end;
-    const PetscInt  lrows   = r_end - r_start;
+static PetscErrorCode levelMatvec(Mat M, Vec x, Vec y) {
+    LevelCtx* ctx; MatShellGetContext(M, (void**)&ctx);
+    const PetscInt lrows = ctx->r_end - ctx->r_start;
+    PetscMPIInt size; MPI_Comm_size(PETSC_COMM_WORLD, &size);
 
-    {
-        const PetscScalar* xa;
-        VecGetArrayRead(x, &xa);
-        Vec xl; VecGhostGetLocalForm(ctx->x_ghost, &xl);
-        PetscScalar* ga; VecGetArray(xl, &ga);
-        for (PetscInt i = 0; i < lrows; i++) ga[i] = xa[i];
-        VecRestoreArray(xl, &ga);
-        VecGhostRestoreLocalForm(ctx->x_ghost, &xl);
-        VecRestoreArrayRead(x, &xa);
+    const PetscScalar* d_xa; 
+    VecCUDAGetArrayRead(x, &d_xa);
+    PetscScalar* d_ya;
+    VecCUDAGetArrayWrite(y, &d_ya);
+
+    if (size == 1) {
+        // Fast path: bypass intermediate copy buffer entirely. Write straight to d_ya
+        launch_matvec(d_xa, d_ya, ctx->d_R, ctx->r_start, ctx->r_end, ctx->Xl, ctx->Yl,
+                      ctx->source_local_idx, ctx->above_halo_start_global, ctx->above_halo_start_local,
+                      ctx->below_halo_start_global, ctx->below_halo_start_local);
+    } else {
+        cuda_memcpy_device_to_device(ctx->d_xlocal, d_xa, (size_t)lrows * sizeof(double));
+        ghostExchangeExecute(*ctx);
+        launch_matvec(ctx->d_xlocal, ctx->d_y, ctx->d_R, ctx->r_start, ctx->r_end, ctx->Xl, ctx->Yl,
+                      ctx->source_local_idx, ctx->above_halo_start_global, ctx->above_halo_start_local,
+                      ctx->below_halo_start_global, ctx->below_halo_start_local);
+        cuda_memcpy_device_to_device(d_ya, ctx->d_y, (size_t)lrows * sizeof(double));
     }
-    VecGhostUpdateBegin(ctx->x_ghost, INSERT_VALUES, SCATTER_FORWARD);
-    VecGhostUpdateEnd  (ctx->x_ghost, INSERT_VALUES, SCATTER_FORWARD);
+    VecCUDARestoreArrayRead(x, &d_xa);
+    VecCUDARestoreArrayWrite(y, &d_ya);
 
-    Vec xl; VecGhostGetLocalForm(ctx->x_ghost, &xl);
-    const PetscScalar* xarr; VecGetArrayRead(xl, &xarr);
-    PetscScalar* yarr;       VecGetArray(y, &yarr);
-
-    for (PetscInt r = r_start; r < r_end; r++) {
-        PetscInt lr = r - r_start;
-        if (r == 0) {
-            double diag = 0.0, val = 0.0;
-            for (PetscInt j = 0; j < Yl; j++) {
-                double gv = 2.0 / R[j];
-                val  += -gv * xarr[globalToLocal(ctx, j+1)];
-                diag += gv;
-            }
-            yarr[lr] = diag * xarr[lr] + val;
-        } else {
-            PetscInt gi = r-1, i = gi/Yl, j = gi%Yl;
-            double diag = 0.0, val = 0.0;
-
-            if (i == 0) {
-                double gv = 2.0 / R[gi];
-                val  += -gv * xarr[globalToLocal(ctx, 0)];
-                diag += gv;
-            } else {
-                double gv = gmean(R[gi], R[(i-1)*Yl+j]);
-                val  += -gv * xarr[globalToLocal(ctx, r-Yl)];
-                diag += gv;
-            }
-            if (j > 0) {
-                double gv = gmean(R[gi], R[i*Yl+(j-1)]);
-                val  += -gv * xarr[globalToLocal(ctx, r-1)];
-                diag += gv;
-            }
-            if (j < Yl-1) {
-                double gv = gmean(R[gi], R[i*Yl+(j+1)]);
-                val  += -gv * xarr[globalToLocal(ctx, r+1)];
-                diag += gv;
-            }
-            if (i < Xl-1) {
-                double gv = gmean(R[gi], R[(i+1)*Yl+j]);
-                val  += -gv * xarr[globalToLocal(ctx, r+Yl)];
-                diag += gv;
-            } else {
-                diag += 2.0 / R[gi];
-            }
-            yarr[lr] = diag * xarr[lr] + val;
-        }
-    }
-
-    VecRestoreArrayRead(xl, &xarr);
-    VecGhostRestoreLocalForm(ctx->x_ghost, &xl);
-    VecRestoreArray(y, &yarr);
     return 0;
 }
 
-// ============================================================
-// Diagonal extraction for Jacobi sub-PC.
-// ============================================================
-static PetscErrorCode levelGetDiagonal(Mat M, Vec diag)
-{
-    LevelCtx* ctx;
-    MatShellGetContext(M, (void**)&ctx);
-    const PetscInt Xl = ctx->Xl, Yl = ctx->Yl;
-    const double* R  = ctx->Rgrid.data();
-
-    PetscScalar* d; VecGetArray(diag, &d);
-    for (PetscInt r = ctx->r_start; r < ctx->r_end; r++) {
-        PetscInt lr = r - ctx->r_start;
-        if (r == 0) {
-            double v = 0.0;
-            for (PetscInt j = 0; j < Yl; j++) v += 2.0 / R[j];
-            d[lr] = v;
-        } else {
-            PetscInt gi = r-1, i = gi/Yl, j = gi%Yl;
-            double v = 0.0;
-            if (i == 0)    v += 2.0 / R[gi];
-            else           v += gmean(R[gi], R[(i-1)*Yl+j]);
-            if (j > 0)     v += gmean(R[gi], R[i*Yl+(j-1)]);
-            if (j < Yl-1)  v += gmean(R[gi], R[i*Yl+(j+1)]);
-            if (i < Xl-1)  v += gmean(R[gi], R[(i+1)*Yl+j]);
-            else            v += 2.0 / R[gi];
-            d[lr] = v;
-        }
-    }
-    VecRestoreArray(diag, &d);
+static PetscErrorCode levelGetDiagonal(Mat M, Vec diag) {
+    LevelCtx* ctx; MatShellGetContext(M, (void**)&ctx);
+    PetscScalar* d; 
+    VecCUDAGetArrayWrite(diag, &d);
+    launch_diagonal(d, ctx->d_R, ctx->r_start, ctx->r_end, ctx->Xl, ctx->Yl);
+    VecCUDARestoreArrayWrite(diag, &d);
     return 0;
 }
 
-// ============================================================
-// Coarsen Rgrid 2x
-// ============================================================
-static std::vector<double> coarsenRgrid(
-    const double* Rf, PetscInt Xf, PetscInt Yf,
-    PetscInt Xc, PetscInt Yc)
-{
+static PetscErrorCode restrictVec(Mat Rmat, Vec xf, Vec xc) {
+    IntergridCtx* ig; MatShellGetContext(Rmat, (void**)&ig);
+    PetscMPIInt size; MPI_Comm_size(PETSC_COMM_WORLD, &size);
+
+    const PetscScalar* d_xf; VecCUDAGetArrayRead(xf, &d_xf);
+    PetscScalar* d_xc;       VecCUDAGetArrayWrite(xc, &d_xc);
+
+    if (size == 1) {
+        launch_restrict(d_xf, d_xc, ig->coarse->r_start, ig->coarse->r_end,
+                        ig->fine->Xl, ig->fine->Yl, ig->coarse->Yl, ig->fine_seq_offset);
+    } else {
+        // [Fallback MPI Scatter Logic]
+    }
+
+    VecCUDARestoreArrayRead(xf, &d_xf);
+    VecCUDARestoreArrayWrite(xc, &d_xc);
+    return 0;
+}
+
+static PetscErrorCode prolongVec(Mat Pmat, Vec xc, Vec xf) {
+    IntergridCtx* ig; MatShellGetContext(Pmat, (void**)&ig);
+    PetscMPIInt size; MPI_Comm_size(PETSC_COMM_WORLD, &size);
+
+    const PetscScalar* d_xc; VecCUDAGetArrayRead(xc, &d_xc);
+    PetscScalar* d_xf;       VecCUDAGetArrayWrite(xf, &d_xf);
+
+    if (size == 1) {
+        launch_prolong(d_xc, d_xf, ig->fine->r_start, ig->fine->r_end,
+                       ig->fine->Yl, ig->coarse->Yl, ig->coarse->Xl,
+                       ig->coarse_seq_offset, ig->coarse_seq_ic_end);
+    } else {
+        // [Fallback MPI Scatter Logic]
+    }
+
+    VecCUDARestoreArrayRead(xc, &d_xc);
+    VecCUDARestoreArrayWrite(xf, &d_xf);
+    return 0;
+}
+
+static std::vector<double> coarsenRgrid(const double* Rf, PetscInt Xf, PetscInt Yf, PetscInt Xc, PetscInt Yc) {
     std::vector<double> Rc(Xc * Yc);
-    for (PetscInt ic = 0; ic < Xc; ic++) {
+    for (PetscInt ic = 0; ic < Xc; ic++)
         for (PetscInt jc = 0; jc < Yc; jc++) {
             PetscInt if0=2*ic, if1=std::min(2*ic+1,Xf-1);
             PetscInt jf0=2*jc, jf1=std::min(2*jc+1,Yf-1);
@@ -225,321 +179,82 @@ static std::vector<double> coarsenRgrid(
             if (if1!=if0&&jf1!=jf0) acc(Rf[if1*Yf+jf1]);
             Rc[ic*Yc+jc] = (double)cnt/si;
         }
-    }
     return Rc;
 }
 
-static void getOwnershipRange(PetscInt n, PetscMPIInt rank, PetscMPIInt nprocs,
-                               PetscInt& rs, PetscInt& re)
-{
+static void getOwnershipRange(PetscInt n, PetscMPIInt rank, PetscMPIInt nprocs, PetscInt& rs, PetscInt& re) {
     PetscInt base=n/nprocs, extra=n%nprocs;
     rs = rank*base + std::min((PetscInt)rank, extra);
     re = rs + base + ((PetscInt)rank < extra ? 1 : 0);
 }
 
 static void buildGhostVec(LevelCtx& ctx, MPI_Comm comm) {
-    std::vector<PetscInt> g;
-    // 1. Every rank can ghost the source node (index 0)
-    g.push_back(0);
-
-    // 2. Halo Above: Need Yl nodes to satisfy (r - Yl)
+    std::vector<PetscInt> g; g.push_back(0);
     ctx.above_halo_start_global = std::max((PetscInt)1, ctx.r_start - ctx.Yl);
-    for (PetscInt i = ctx.above_halo_start_global; i < ctx.r_start; i++) {
-        if (i != 0) g.push_back(i);
-    }
-
-    // 3. Halo Below: Need Yl nodes to satisfy (r + Yl)
+    for (PetscInt i = ctx.above_halo_start_global; i < ctx.r_start; i++) if (i != 0) g.push_back(i);
     ctx.below_halo_start_global = ctx.r_end;
     PetscInt below_halo_end = std::min(ctx.n, ctx.r_end + ctx.Yl);
-    for (PetscInt i = ctx.below_halo_start_global; i < below_halo_end; i++) {
-        g.push_back(i);
-    }
+    for (PetscInt i = ctx.below_halo_start_global; i < below_halo_end; i++) g.push_back(i);
 
     std::sort(g.begin(), g.end());
     g.erase(std::unique(g.begin(), g.end()), g.end());
-    
-    PetscInt lr = ctx.r_end - ctx.r_start;
-    // Set up O(1) mapping offsets
-    ctx.source_local_idx = -1;
-    ctx.above_halo_start_local = -1;
-    ctx.below_halo_start_local = -1;
 
-    for (size_t i = 0; i < g.size(); i++) {
-        if (g[i] == 0) ctx.source_local_idx = lr + i;
+    PetscInt lr = ctx.r_end - ctx.r_start;
+    PetscInt nghosts = (PetscInt)g.size();
+
+    ctx.source_local_idx = -1; ctx.above_halo_start_local = -1; ctx.below_halo_start_local = -1;
+    for (PetscInt i = 0; i < nghosts; i++) {
+        if (g[i] == 0)                           ctx.source_local_idx       = lr + i;
         if (g[i] == ctx.above_halo_start_global) ctx.above_halo_start_local = lr + i;
         if (g[i] == ctx.below_halo_start_global) ctx.below_halo_start_local = lr + i;
     }
 
-    VecCreateGhost(comm, lr, ctx.n, (PetscInt)g.size(), g.data(), &ctx.x_ghost);
+    VecCreateGhost(comm, lr, ctx.n, nghosts, g.data(), &ctx.x_ghost_host);
+    ctx.xlocal_total = lr + nghosts;
+    cuda_malloc((void**)&ctx.d_R, (size_t)(ctx.Xl * ctx.Yl) * sizeof(double));
+    cuda_malloc((void**)&ctx.d_xlocal, (size_t)ctx.xlocal_total * sizeof(double));
+    cuda_malloc((void**)&ctx.d_y, (size_t)lr * sizeof(double));
+    buildGhostExchange(ctx, g, comm);
 }
 
-// ============================================================
-// Intergrid context.
-// Both scatter operations now use ISCreateStride/General to 
-// prevent global broadcasts.
-// ============================================================
-static IntergridCtx* buildIntergridCtx(LevelCtx* fine, LevelCtx* coarse,
-                                        MPI_Comm comm)
-{
+static IntergridCtx* buildIntergridCtx(LevelCtx* fine, LevelCtx* coarse, MPI_Comm comm) {
     IntergridCtx* ig = new IntergridCtx();
-    ig->fine   = fine;
-    ig->coarse = coarse;
-
+    ig->fine = fine; ig->coarse = coarse;
+    
     const PetscInt Yf = fine->Yl;
-    const PetscInt Yc = coarse->Yl;
-
-    // --- FINE SCATTER (for restriction) ---
-    // Gather the band of fine rows covering owned coarse rows.
-    PetscInt ic_start = -1, ic_end = -1;
+    PetscInt ic_start = -1;
     for (PetscInt rc = coarse->r_start; rc < coarse->r_end; rc++) {
         if (rc == 0) continue;
-        PetscInt ic = (rc - 1) / Yc;
+        PetscInt ic = (rc - 1) / coarse->Yl;
         if (ic_start < 0) ic_start = ic;
-        ic_end = ic;
     }
+    ig->fine_seq_offset = (ic_start >= 0) ? (2*ic_start)*Yf + 1 : 0;
 
-    std::vector<PetscInt> indices;
-    indices.push_back(0);  // source node always needed
-
-    if (ic_start >= 0) {
-        PetscInt fi_start = 2 * ic_start;
-        PetscInt fi_end   = std::min(2 * ic_end + 1, fine->Xl - 1);
-        for (PetscInt fi = fi_start; fi <= fi_end; fi++)
-            for (PetscInt fj = 0; fj < Yf; fj++)
-                indices.push_back(fi * Yf + fj + 1);
-    }
-
-    ig->fine_seq_offset      = (ic_start >= 0) ? (2*ic_start)*Yf + 1 : 0;
-    ig->fine_seq_source_slot = 0;
-    PetscInt n_seq = (PetscInt)indices.size();
-
-    {
-        Vec fine_mpi;
-        VecCreateMPI(comm, fine->r_end - fine->r_start, fine->n, &fine_mpi);
-        IS from_is, to_is;
-        ISCreateGeneral(PETSC_COMM_SELF, n_seq, indices.data(),
-                        PETSC_COPY_VALUES, &from_is);
-        ISCreateStride(PETSC_COMM_SELF, n_seq, 0, 1, &to_is);
-        VecCreateSeq(PETSC_COMM_SELF, n_seq, &ig->fine_seq);
-        VecScatterCreate(fine_mpi, from_is, ig->fine_seq, to_is,
-                         &ig->fine_scatter);
-        ISDestroy(&from_is);
-        ISDestroy(&to_is);
-        VecDestroy(&fine_mpi);
-    }
-
-    // --- COARSE SCATTER (for prolongation) ---
-    // Find which coarse ic rows this rank needs for its owned fine rows.
-    // Bilinear interpolation means a fine node at ic row needs coarse
-    // rows ic/2 AND ic/2+1, so we extend the upper end by 1.
     PetscInt ic_start_prol = -1, ic_end_prol = -1;
     for (PetscInt rf = fine->r_start; rf < fine->r_end; rf++) {
         if (rf == 0) continue;
-        PetscInt gf  = rf - 1;
-        PetscInt iff = gf / Yf;
-        PetscInt ic  = iff / 2;
+        PetscInt ic = ((rf - 1) / Yf) / 2;
         if (ic_start_prol < 0) ic_start_prol = ic;
         ic_end_prol = ic;
     }
-
-    // Extend by 1 to cover the ic+1 neighbor in bilinear weights.
-    // Clamp to the actual coarse grid boundary.
-    if (ic_end_prol >= 0)
-        ic_end_prol = std::min(ic_end_prol + 1, coarse->Xl - 1);
-
-    ig->coarse_seq_offset = (ic_start_prol >= 0) ? ic_start_prol * Yc + 1 : 0;
-    ig->coarse_seq_ic_end = ic_end_prol;  // store for bounds check in prolongVec
-
-    std::vector<PetscInt> c_indices;
-    c_indices.push_back(0);  // source node always needed
-    if (ic_start_prol >= 0) {
-        for (PetscInt ic = ic_start_prol; ic <= ic_end_prol; ic++)
-            for (PetscInt jc = 0; jc < Yc; jc++)
-                c_indices.push_back(ic * Yc + jc + 1);
-    }
-
-    PetscInt n_seq_c = (PetscInt)c_indices.size();
-
-    {
-        Vec coarse_mpi;
-        VecCreateMPI(comm, coarse->r_end - coarse->r_start,
-                     coarse->n, &coarse_mpi);
-        IS from_is_c, to_is_c;
-        ISCreateGeneral(PETSC_COMM_SELF, n_seq_c, c_indices.data(),
-                        PETSC_COPY_VALUES, &from_is_c);
-        ISCreateStride(PETSC_COMM_SELF, n_seq_c, 0, 1, &to_is_c);
-        VecCreateSeq(PETSC_COMM_SELF, n_seq_c, &ig->coarse_seq);
-        VecScatterCreate(coarse_mpi, from_is_c, ig->coarse_seq, to_is_c,
-                         &ig->coarse_scatter);
-        ISDestroy(&from_is_c);
-        ISDestroy(&to_is_c);
-        VecDestroy(&coarse_mpi);
-    }
+    ig->coarse_seq_offset = (ic_start_prol >= 0) ? ic_start_prol * coarse->Yl + 1 : 0;
+    ig->coarse_seq_ic_end = std::min(ic_end_prol + 1, coarse->Xl - 1);
 
     return ig;
 }
 
-// ============================================================
-// Restriction: xc = R * xf
-// ============================================================
-static PetscErrorCode restrictVec(Mat Rmat, Vec xf, Vec xc)
-{
-    IntergridCtx* ig;
-    MatShellGetContext(Rmat, (void**)&ig);
-    LevelCtx* fine   = ig->fine;
-    LevelCtx* coarse = ig->coarse;
-
-    VecScatterBegin(ig->fine_scatter, xf, ig->fine_seq, INSERT_VALUES, SCATTER_FORWARD);
-    VecScatterEnd  (ig->fine_scatter, xf, ig->fine_seq, INSERT_VALUES, SCATTER_FORWARD);
-
-    const PetscScalar* fseq; VecGetArrayRead(ig->fine_seq, &fseq);
-    PetscScalar* xca;  VecGetArray(xc, &xca);
-
-    const PetscInt Yf = fine->Yl, Yc = coarse->Yl;
-
-    auto fget = [&](PetscInt gi) -> PetscScalar {
-        if (gi == 0) return fseq[0];
-        return fseq[gi - ig->fine_seq_offset + 1];
-    };
-
-    for (PetscInt rc = coarse->r_start; rc < coarse->r_end; rc++) {
-        PetscInt lc = rc - coarse->r_start;
-        if (rc == 0) {
-            xca[lc] = fseq[0];
-        } else {
-            PetscInt gc = rc - 1;
-            PetscInt ic = gc / Yc, jc = gc % Yc;
-            PetscInt if0=2*ic, if1=std::min(2*ic+1, fine->Xl-1);
-            PetscInt jf0=2*jc, jf1=std::min(2*jc+1, Yf-1);
-            int cnt=0; PetscScalar sum=0.0;
-            auto acc=[&](PetscInt ri, PetscInt rj){
-                sum += fget(ri*Yf + rj + 1); cnt++;
-            };
-            acc(if0,jf0);
-            if (jf1!=jf0) acc(if0,jf1);
-            if (if1!=if0) acc(if1,jf0);
-            if (if1!=if0&&jf1!=jf0) acc(if1,jf1);
-            xca[lc] = sum/(PetscScalar)cnt;
-        }
-    }
-
-    VecRestoreArrayRead(ig->fine_seq, &fseq);
-    VecRestoreArray(xc, &xca);
-    return 0;
-}
-
-// ============================================================
-// Prolongation: xf = P * xc
-// ============================================================
-static PetscErrorCode prolongVec(Mat Pmat, Vec xc, Vec xf)
-{
-    IntergridCtx* ig;
-    MatShellGetContext(Pmat, (void**)&ig);
-    LevelCtx* fine   = ig->fine;
-    LevelCtx* coarse = ig->coarse;
-
-    VecScatterBegin(ig->coarse_scatter, xc, ig->coarse_seq,
-                    INSERT_VALUES, SCATTER_FORWARD);
-    VecScatterEnd  (ig->coarse_scatter, xc, ig->coarse_seq,
-                    INSERT_VALUES, SCATTER_FORWARD);
-
-    const PetscScalar* cseq; VecGetArrayRead(ig->coarse_seq, &cseq);
-    PetscScalar*       xfa;  VecGetArray(xf, &xfa);
-
-    const PetscInt Yf = fine->Yl, Yc = coarse->Yl;
-
-    // Map coarse global index -> cseq slot.
-    // gi==0: source node at slot 0.
-    // gi>=1: slot = 1 + (gi - coarse_seq_offset)
-    auto cget = [&](PetscInt gi) -> PetscScalar {
-        if (gi == 0) return cseq[0];
-        return cseq[1 + (gi - ig->coarse_seq_offset)];
-    };
-
-    for (PetscInt rf = fine->r_start; rf < fine->r_end; rf++) {
-        PetscInt lf = rf - fine->r_start;
-
-        if (rf == 0) {
-            // Source node: direct injection, no spatial position.
-            xfa[lf] = cseq[0];
-            continue;
-        }
-
-        PetscInt gf  = rf - 1;
-        PetscInt iff = gf / Yf;   // fine grid row index
-        PetscInt jf  = gf % Yf;   // fine grid col index
-
-        // Coarse cell this fine node lives in.
-        PetscInt ic = iff / 2;
-        PetscInt jc = jf  / 2;
-
-        // Bilinear weights in i (row) direction.
-        // Even iff: fine node coincides with coarse row ic.
-        //   -> all weight on ic, none on ic+1.
-        // Odd iff: fine node is halfway between coarse rows ic and ic+1.
-        //   -> equal weight on both.
-        double wi0, wi1;
-        if (iff % 2 == 0) { wi0 = 1.0; wi1 = 0.0; }
-        else               { wi0 = 0.5; wi1 = 0.5; }
-
-        // Bilinear weights in j (col) direction. Same logic.
-        double wj0, wj1;
-        if (jf % 2 == 0) { wj0 = 1.0; wj1 = 0.0; }
-        else              { wj0 = 0.5; wj1 = 0.5; }
-
-        // Neighbouring coarse rows/cols, clamped to grid boundary.
-        // At boundaries the fine node has no neighbour beyond the edge,
-        // so the weight naturally falls entirely on the boundary coarse node
-        // (wi1/wj1 == 0 whenever iff/jf is even, which it always is at the
-        // boundary for a 2x coarsening). The clamp is a safety net for
-        // non-power-of-2 grids where the last fine row may be odd.
-        PetscInt ic1 = std::min(ic + 1, coarse->Xl - 1);
-        PetscInt jc1 = std::min(jc + 1, coarse->Yl - 1);
-
-        // Compute the 4 coarse global indices.
-        // Coarse global index of grain (ic, jc) = ic*Yc + jc + 1
-        // (+1 for source node offset).
-        PetscInt g00 = ic  * Yc + jc  + 1;
-        PetscInt g01 = ic  * Yc + jc1 + 1;
-        PetscInt g10 = ic1 * Yc + jc  + 1;
-        PetscInt g11 = ic1 * Yc + jc1 + 1;
-
-        xfa[lf] = wi0*wj0 * cget(g00)
-                + wi0*wj1 * cget(g01)
-                + wi1*wj0 * cget(g10)
-                + wi1*wj1 * cget(g11);
-    }
-
-    VecRestoreArrayRead(ig->coarse_seq, &cseq);
-    VecRestoreArray(xf, &xfa);
-    return 0;
-}
-
-// ============================================================
-// MGLevel and MGData
-// ============================================================
 struct MGLevel { LevelCtx ctx; Mat mat; };
+struct MGData  { std::vector<MGLevel> levels; int nlevels=0; };
 
-struct MGData {
-    std::vector<MGLevel> levels;   // [0]=finest, [nlevels-1]=coarsest
-    int nlevels = 0;
-};
-
-static void buildLevelMat(MGLevel& lv, MPI_Comm comm)
-{
+static void buildLevelMat(MGLevel& lv, MPI_Comm comm) {
     PetscInt lr = lv.ctx.r_end - lv.ctx.r_start;
     MatCreateShell(comm, lr, lr, lv.ctx.n, lv.ctx.n, &lv.ctx, &lv.mat);
-    MatShellSetOperation(lv.mat, MATOP_MULT,
-                         (void(*)(void))levelMatvec);
-    MatShellSetOperation(lv.mat, MATOP_GET_DIAGONAL,
-                         (void(*)(void))levelGetDiagonal);
+    MatSetVecType(lv.mat, VECCUDA); // Ensure Krylov vectors default to VECCUDA 
+    MatShellSetOperation(lv.mat, MATOP_MULT, (void(*)(void))levelMatvec);
+    MatShellSetOperation(lv.mat, MATOP_GET_DIAGONAL, (void(*)(void))levelGetDiagonal);
 }
 
-static MGData buildMGData(const double* fine_Rgrid,
-                           PetscInt X, PetscInt Y,
-                           PetscMPIInt rank, PetscMPIInt nprocs,
-                           MPI_Comm comm, int coarse_threshold=32)
-{
+static MGData buildMGData(const double* fine_Rgrid, PetscInt X, PetscInt Y, PetscMPIInt rank, PetscMPIInt nprocs, MPI_Comm comm, int coarse_threshold=32) {
     MGData mg;
     std::vector<std::pair<PetscInt,PetscInt>> sizes;
     PetscInt cx=X, cy=Y;
@@ -551,355 +266,248 @@ static MGData buildMGData(const double* fine_Rgrid,
     mg.nlevels = (int)sizes.size();
     mg.levels.resize(mg.nlevels);
 
-    if (rank == 0)
-        printf("  GMG: %d levels, coarsest %dx%d (%lld DOFs)\n",
-               mg.nlevels,
-               (int)sizes.back().first, (int)sizes.back().second,
-               (long long)(sizes.back().first*sizes.back().second+1));
+    if (rank==0) printf("  GMG: %d levels, coarsest %dx%d (%lld DOFs)\n", mg.nlevels,(int)sizes.back().first,(int)sizes.back().second, (long long)(sizes.back().first*sizes.back().second+1));
 
-    for (int lv = 0; lv < mg.nlevels; lv++) {
+    for (int lv=0; lv<mg.nlevels; lv++) {
         auto& L  = mg.levels[lv];
-        L.ctx.Xl = sizes[lv].first;
-        L.ctx.Yl = sizes[lv].second;
-        L.ctx.n  = L.ctx.Xl * L.ctx.Yl + 1;
-        getOwnershipRange(L.ctx.n, rank, nprocs,
-                          L.ctx.r_start, L.ctx.r_end);
+        L.ctx.Xl = sizes[lv].first; L.ctx.Yl = sizes[lv].second; L.ctx.n  = L.ctx.Xl * L.ctx.Yl + 1;
+        getOwnershipRange(L.ctx.n, rank, nprocs, L.ctx.r_start, L.ctx.r_end);
         buildGhostVec(L.ctx, comm);
-        L.ctx.Rgrid.resize(L.ctx.Xl * L.ctx.Yl, 1.0);
         buildLevelMat(L, comm);
     }
 
-    // Initial fill from fine_Rgrid.
     mg.levels[0].ctx.Rgrid.assign(fine_Rgrid, fine_Rgrid + X*Y);
-    for (int lv = 1; lv < mg.nlevels; lv++) {
+    for (int lv=1; lv<mg.nlevels; lv++) {
         auto& p = mg.levels[lv-1].ctx;
         auto& c = mg.levels[lv].ctx;
         c.Rgrid = coarsenRgrid(p.Rgrid.data(), p.Xl, p.Yl, c.Xl, c.Yl);
     }
-
+    for (int lv=0; lv<mg.nlevels; lv++) {
+        auto& ctx = mg.levels[lv].ctx;
+        cuda_memcpy_to_device(ctx.d_R, ctx.Rgrid.data(), (size_t)(ctx.Xl*ctx.Yl)*sizeof(double));
+    }
     return mg;
 }
 
-static void rebuildCoarseLevels(MGData& mg, const double* fine_Rgrid)
-{
-    mg.levels[0].ctx.Rgrid.assign(
-        fine_Rgrid,
-        fine_Rgrid + mg.levels[0].ctx.Xl * mg.levels[0].ctx.Yl);
-    for (int lv = 1; lv < mg.nlevels; lv++) {
+static void rebuildCoarseLevelsGPU(MGData& mg) {
+    for (int lv=1; lv<mg.nlevels; lv++) {
         auto& p = mg.levels[lv-1].ctx;
         auto& c = mg.levels[lv].ctx;
-        c.Rgrid = coarsenRgrid(p.Rgrid.data(), p.Xl, p.Yl, c.Xl, c.Yl);
+        launch_coarsen(p.d_R, c.d_R, p.Xl, p.Yl, c.Xl, c.Yl);
     }
 }
 
-// ============================================================
-// PCMGSetupData: owns intergrid contexts and MatShells.
-// ============================================================
 struct PCMGSetupData {
     std::vector<IntergridCtx*> ig_ctxs;
-    std::vector<Mat>           R_mats;
-    std::vector<Mat>           P_mats;
+    std::vector<Mat> R_mats, P_mats;
 };
 
-static PetscErrorCode setupPCMG(PC pc, MGData& mg,
-                                  PCMGSetupData& setup, MPI_Comm comm)
-{
-    auto PCMGstart = Clock::now();
+static PetscErrorCode setupPCMG(PC pc, MGData& mg, PCMGSetupData& setup, MPI_Comm comm) {
     int nlevels = mg.nlevels;
-
     PCSetType(pc, PCMG);
     PCMGSetLevels(pc, nlevels, NULL);
     PCMGSetType(pc, PC_MG_MULTIPLICATIVE);
     PCMGSetCycleType(pc, PC_MG_CYCLE_W);
 
-    setup.ig_ctxs.resize(nlevels - 1, nullptr);
-    setup.R_mats.resize(nlevels - 1, nullptr);
-    setup.P_mats.resize(nlevels - 1, nullptr);
-    print_elapsed(0, "first", PCMGstart, Clock::now());
+    setup.ig_ctxs.resize(nlevels-1, nullptr);
+    setup.R_mats.resize(nlevels-1, nullptr);
+    setup.P_mats.resize(nlevels-1, nullptr);
 
-    for (int lv = 0; lv < nlevels; lv++) {
-        int pcmg_lv = (nlevels-1) - lv;
-        PCMGSetOperators(pc, pcmg_lv,
-                         mg.levels[lv].mat, mg.levels[lv].mat);
-    }
-    print_elapsed(0, "second", PCMGstart, Clock::now());
+    for (int lv=0; lv<nlevels; lv++) PCMGSetOperators(pc,(nlevels-1)-lv, mg.levels[lv].mat, mg.levels[lv].mat);
 
-    for (int lv = 0; lv < nlevels-1; lv++) {
-        int pcmg_fine = (nlevels-1) - lv; 
-
+    for (int lv=0; lv<nlevels-1; lv++) {
+        int pcmg_fine = (nlevels-1)-lv;
         LevelCtx* fine_ctx   = &mg.levels[lv].ctx;
         LevelCtx* coarse_ctx = &mg.levels[lv+1].ctx;
-
         IntergridCtx* ig = buildIntergridCtx(fine_ctx, coarse_ctx, comm);
         setup.ig_ctxs[lv] = ig;
 
-        PetscInt nf=fine_ctx->n,   lf=fine_ctx->r_end   - fine_ctx->r_start;
-        PetscInt nc=coarse_ctx->n, lc=coarse_ctx->r_end  - coarse_ctx->r_start;
+        PetscInt nf=fine_ctx->n, lf=fine_ctx->r_end - fine_ctx->r_start;
+        PetscInt nc=coarse_ctx->n, lc=coarse_ctx->r_end - coarse_ctx->r_start;
 
         MatCreateShell(comm, lc, lf, nc, nf, ig, &setup.R_mats[lv]);
-        MatShellSetOperation(setup.R_mats[lv], MATOP_MULT,
-                             (void(*)(void))restrictVec);
-
+        MatSetVecType(setup.R_mats[lv], VECCUDA); // Ensure proper PC vec types
+        MatShellSetOperation(setup.R_mats[lv], MATOP_MULT, (void(*)(void))restrictVec);
+        
         MatCreateShell(comm, lf, lc, nf, nc, ig, &setup.P_mats[lv]);
-        MatShellSetOperation(setup.P_mats[lv], MATOP_MULT,
-                             (void(*)(void))prolongVec);
-
+        MatSetVecType(setup.P_mats[lv], VECCUDA); // Ensure proper PC vec types
+        MatShellSetOperation(setup.P_mats[lv], MATOP_MULT, (void(*)(void))prolongVec);
+        
         PCMGSetRestriction (pc, pcmg_fine, setup.R_mats[lv]);
         PCMGSetInterpolation(pc, pcmg_fine, setup.P_mats[lv]);
     }
-    print_elapsed(0, "third", PCMGstart, Clock::now());
 
-    // Keeping your previous smoother setups but allowing command line to override
-    for (int pcmg_lv = 1; pcmg_lv < nlevels; pcmg_lv++) {
-        KSP smoother;
-        PCMGGetSmoother(pc, pcmg_lv, &smoother);
+    for (int pcmg_lv=1; pcmg_lv<nlevels; pcmg_lv++) {
+        KSP smoother; PCMGGetSmoother(pc, pcmg_lv, &smoother);
         KSPSetType(smoother, KSPCHEBYSHEV);
         PC sub_pc; KSPGetPC(smoother, &sub_pc);
         PCSetType(sub_pc, PCJACOBI);
-        KSPSetTolerances(smoother, PETSC_DEFAULT, PETSC_DEFAULT,
-                         PETSC_DEFAULT, 2);
+        KSPSetTolerances(smoother, PETSC_DEFAULT, PETSC_DEFAULT, PETSC_DEFAULT, 2);
         KSPChebyshevEstEigSet(smoother, 0.0, 0.1, 0.0, 1.3);
         KSPChebyshevEstEigSetUseNoisy(smoother, PETSC_TRUE);
     }
-    print_elapsed(0, "fourth", PCMGstart, Clock::now());
 
-    // Coarsest level
-    {
-        KSP coarse_ksp;
-        PCMGGetCoarseSolve(pc, &coarse_ksp);
-        KSPSetType(coarse_ksp, KSPGMRES);
-        KSPGMRESSetRestart(coarse_ksp, 200);
-        PC cpc; KSPGetPC(coarse_ksp, &cpc);
-        PCSetType(cpc, PCJACOBI);
-        KSPSetTolerances(coarse_ksp, 1e-12, PETSC_DEFAULT,
-                         PETSC_DEFAULT, 200);
-    }
-    print_elapsed(0, "fifth", PCMGstart, Clock::now());
-
+    KSP coarse_ksp; PCMGGetCoarseSolve(pc, &coarse_ksp);
+    KSPSetType(coarse_ksp, KSPGMRES);
+    KSPGMRESSetRestart(coarse_ksp, 200);
+    PC cpc; KSPGetPC(coarse_ksp, &cpc);
+    PCSetType(cpc, PCJACOBI);
+    KSPSetTolerances(coarse_ksp, 1e-12, PETSC_DEFAULT, PETSC_DEFAULT, 200);
     return 0;
 }
 
-// ============================================================
-// MAIN
-// ============================================================
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     auto t_prog_start = Clock::now();
-
-#ifdef _WIN32
-    _putenv_s("MKL_INTERFACE_LAYER", "LP64");
-    _putenv_s("MKL_THREADING_LAYER", "INTEL");
-    _putenv_s("MKL_NUM_THREADS", "1");
-#endif
-
     PetscInitialize(&argc, &argv, NULL, NULL);
 
     PetscMPIInt rank, nprocs;
     MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
     MPI_Comm_size(PETSC_COMM_WORLD, &nprocs);
 
-    if (rank == 0) printf("=== Initialization (nprocs=%d) ===\n", nprocs);
+    if (rank==0) printf("=== Initialization (nprocs=%d) ===\n", nprocs);
+    if (nprocs > 1) {
+        printf("WARNING: Code optimized for -n 1. High latency expected with -n %d.\n", nprocs);
+    }
 
-    PetscInt X = 100, Y = 100;
-    PetscOptionsGetInt(NULL, NULL, "-X", &X, NULL);
-    PetscOptionsGetInt(NULL, NULL, "-Y", &Y, NULL);
+    PetscInt X=100, Y=100;
+    PetscOptionsGetInt(NULL,NULL,"-X",&X,NULL);
+    PetscOptionsGetInt(NULL,NULL,"-Y",&Y,NULL);
+    PetscBool save_pics=PETSC_FALSE;
+    PetscOptionsGetBool(NULL,NULL,"-save_pics",&save_pics,NULL);
+    PetscInt coarse_threshold=32;
+    PetscOptionsGetInt(NULL,NULL,"-mg_coarse_threshold",&coarse_threshold,NULL);
 
-    PetscBool save_pics = PETSC_FALSE;
-    PetscOptionsGetBool(NULL, NULL, "-save_pics", &save_pics, NULL);
+    const PetscInt n = X*Y+1;
+    if (rank==0) printf("  Grid: %d x %d  (n = %lld unknowns)\n", (int)X,(int)Y,(long long)n);
 
-    PetscInt coarse_threshold = 32;
-    PetscOptionsGetInt(NULL, NULL, "-mg_coarse_threshold",
-                       &coarse_threshold, NULL);
-
-    const PetscInt n = X * Y + 1;
-    if (rank == 0)
-        printf("  Grid: %d x %d  (n = %lld unknowns)\n",
-               (int)X, (int)Y, (long long)n);
-
-    auto t0 = Clock::now();
-    auto Tgrid_up   = std::make_unique<double[]>(X * Y);
-    auto Tgrid_down = std::make_unique<double[]>(X * Y);
-    auto Rgrid      = std::make_unique<double[]>(X * Y);
+    auto Tgrid_up   = std::make_unique<double[]>(X*Y);
+    auto Tgrid_down = std::make_unique<double[]>(X*Y);
+    auto Rgrid      = std::make_unique<double[]>(X*Y);
 
     Tgridset(Tgrid_up.get(), X, Y, 345.0, 10.0);
-    std::copy(Tgrid_up.get(), Tgrid_up.get() + X*Y, Tgrid_down.get());
+    std::copy(Tgrid_up.get(), Tgrid_up.get()+X*Y, Tgrid_down.get());
     Rgridset(Rgrid.get(), X, Y, 1000.0);
-    print_elapsed(rank, "Grid arrays", t0, Clock::now());
-
-    t0 = Clock::now();
-    precomputeHeatingMap(Tgrid_up.get(),   X, Y, 20.0);
+    precomputeHeatingMap(Tgrid_up.get(), X, Y, 20.0);
     precomputeCoolingMap(Tgrid_down.get(), X, Y, 20.0);
-    print_elapsed(rank, "Heating/cooling cascades", t0, Clock::now());
 
-    t0 = Clock::now();
-    MGData mg = buildMGData(Rgrid.get(), X, Y, rank, nprocs,
-                             PETSC_COMM_WORLD, (int)coarse_threshold);
-    print_elapsed(rank, "MGData hierarchy built", t0, Clock::now());
+    double *d_Tup = nullptr, *d_Tdown = nullptr;
+    cuda_malloc((void**)&d_Tup, (X*Y)*sizeof(double));
+    cuda_malloc((void**)&d_Tdown, (X*Y)*sizeof(double));
+    cuda_memcpy_to_device(d_Tup, Tgrid_up.get(), (X*Y)*sizeof(double));
+    cuda_memcpy_to_device(d_Tdown, Tgrid_down.get(), (X*Y)*sizeof(double));
 
-    t0 = Clock::now();
+    MGData mg = buildMGData(Rgrid.get(), X, Y, rank, nprocs, PETSC_COMM_WORLD, (int)coarse_threshold);
+
     Vec b, x_vec;
-    MatCreateVecs(mg.levels[0].mat, &x_vec, &b);
+    MatCreateVecs(mg.levels[0].mat, &x_vec, &b); 
     VecZeroEntries(b);
-    if (mg.levels[0].ctx.r_start == 0) {
-        PetscScalar one = 1.0;
-        VecSetValue(b, 0, one, INSERT_VALUES);
+    if (mg.levels[0].ctx.r_start==0) {
+        PetscScalar* b_arr;
+        VecGetArray(b, &b_arr);
+        b_arr[0] = 1.0;
+        VecRestoreArray(b, &b_arr);
     }
     VecAssemblyBegin(b); VecAssemblyEnd(b);
-    print_elapsed(rank, "Vectors", t0, Clock::now());
 
-    t0 = Clock::now();
-    KSP ksp;
-    KSPCreate(PETSC_COMM_WORLD, &ksp);
+    KSP ksp; KSPCreate(PETSC_COMM_WORLD, &ksp);
     KSPSetOperators(ksp, mg.levels[0].mat, mg.levels[0].mat);
     KSPSetType(ksp, KSPCG);
     KSPSetTolerances(ksp, 1e-8, PETSC_DEFAULT, PETSC_DEFAULT, 5000);
 
-    PC pc;
-    KSPGetPC(ksp, &pc);
-
+    PC pc; KSPGetPC(ksp, &pc);
     PCMGSetupData mg_setup;
     setupPCMG(pc, mg, mg_setup, PETSC_COMM_WORLD);
-
     KSPSetFromOptions(ksp);
-    print_elapsed(rank, "KSP/PC setup", t0, Clock::now());
 
-    if (rank == 0)
-        printf("  Total init: %.1f ms\n\n",
-               duration<double,std::milli>(Clock::now() - t_prog_start).count());
+    double start_temp=300.0, end_temp=375.0;
+    int total_steps=(int)(end_temp-start_temp);
 
-    auto reassemble = [&]() {
-        rebuildCoarseLevels(mg, Rgrid.get());
-    };
-
-    double start_temp = 300.0, end_temp = 375.0;
-    int total_steps = (int)(end_temp - start_temp);
-
-    FILE* f1 = nullptr;
-    FILE* f2 = nullptr;
-    std::vector<int> sched_up, sched_down;
-    if (rank == 0) {
-        f1 = fopen("results_up.dat", "w");
-        std::set<int> h = generateHighlyBiasedTemps(
-            start_temp, end_temp, 345.0, 15, 5.0);
-        sched_up.assign(h.begin(), h.end());
-
-        f2 = fopen("results_down.dat", "w");
-        std::set<int> c = generateHighlyBiasedTemps(
-            start_temp, end_temp, 335.0, 15, 5.0);
-        sched_down.assign(c.begin(), c.end());
-        std::reverse(sched_down.begin(), sched_down.end());
-
+    FILE *f1=nullptr, *f2=nullptr;
+    if (rank==0) {
+        f1 = fopen("results_up.dat","w");
+        f2 = fopen("results_down.dat","w");
         printf(">>> STARTING HEATING CYCLE <<<\n");
     }
 
-    size_t up_idx = 0;
-    for (int step = 0; step <= total_steps; step+=10) {
-        auto t_loop_start = Clock::now();
-        double temp  = start_temp + (double)step;
+    for (int step=0; step<=total_steps; step+=5) {
+        auto tl = Clock::now();
+        double temp = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
 
-        for (PetscInt i = 0; i < X * Y; i++)
-            Rgrid[i] = (temp >= Tgrid_up[i]) ? 1.0 : ins_R;
-
-        auto t_asm = Clock::now();
-        reassemble();
-        auto t_slv = Clock::now();
-        KSPSolve(ksp, b, x_vec);
-        auto t_end = Clock::now();
-
-        PetscScalar R_tot = 0.0;
-        if (mg.levels[0].ctx.r_start == 0) {
-            PetscInt idx = 0; VecGetValues(x_vec, 1, &idx, &R_tot);
+        launch_update_rgrid(mg.levels[0].ctx.d_R, d_Tup, temp, ins_R, X*Y, true);
+        
+        auto ta=Clock::now(); 
+        rebuildCoarseLevelsGPU(mg); 
+        
+        for (int lv = 0; lv < mg.nlevels; lv++) {
+            MatAssemblyBegin(mg.levels[lv].mat, MAT_FINAL_ASSEMBLY);
+            MatAssemblyEnd(mg.levels[lv].mat, MAT_FINAL_ASSEMBLY);
         }
-        MPI_Bcast(&R_tot, 1, MPI_DOUBLE, 0, PETSC_COMM_WORLD);
+        KSPSetOperators(ksp, mg.levels[0].mat, mg.levels[0].mat);
+        
+        auto ts=Clock::now(); 
+        KSPSolve(ksp,b,x_vec);
+        auto te=Clock::now();
 
-        if (rank == 0) {
-            fprintf(f1, "%f %f\n", temp, PetscRealPart(R_tot));
-            if (save_pics && up_idx < sched_up.size() &&
-                temp >= sched_up[up_idx]) {
-                char fn[64]; sprintf(fn, "heat_%d.png", sched_up[up_idx]);
-                save_rgrid_png(fn, Rgrid.get(), X, Y); up_idx++;
-            }
-            PetscInt its; KSPGetIterationNumber(ksp, &its);
-            printf("Step %3d (H) | T:%.1f | R:%.4e | "
-                   "Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
-                   step, temp, PetscRealPart(R_tot),
-                   duration<double,std::milli>(t_asm-t_loop_start).count(),
-                   duration<double,std::milli>(t_end-t_slv).count(),
-                   duration<double,std::milli>(t_end-t_loop_start).count(),
-                   (int)its);
+        PetscScalar R_tot=0.0;
+        if (mg.levels[0].ctx.r_start==0) {
+            const PetscScalar* x_arr;
+            VecGetArrayRead(x_vec, &x_arr);
+            R_tot = x_arr[0];
+            VecRestoreArrayRead(x_vec, &x_arr);
+        }
+        if (rank==0) {
+            fprintf(f1,"%f %f\n",temp,PetscRealPart(R_tot));
+            PetscInt its; KSPGetIterationNumber(ksp,&its);
+            printf("Step %3d (H) | T:%.1f | R:%.4e | Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
+                   step,temp,PetscRealPart(R_tot), duration<double,std::milli>(ta-tl).count(),
+                   duration<double,std::milli>(te-ts).count(), duration<double,std::milli>(te-tl).count(),(int)its);
         }
     }
 
-    if (rank == 0) { fclose(f1); printf("\n>>> STARTING COOLING CYCLE <<<\n"); }
-    size_t dn_idx = 0;
+    if (rank==0) { printf("\n>>> STARTING COOLING CYCLE <<<\n"); }
 
-    for (int step = total_steps; step >= 0; step-=10) {
-        auto t_loop_start = Clock::now();
-        double temp  = start_temp + (double)step;
+    for (int step=total_steps; step>=0; step-=5) {
+        auto tl=Clock::now();
+        double temp = start_temp + (double)step;
         double ins_R = getSemiconductorR(temp);
-        printf(">>> Step %3d | Temp: %.1f | Ins_R: %.4e\n", step, temp, ins_R);
-        fflush(stdout);
 
-        for (PetscInt i = 0; i < X * Y; i++)
-            Rgrid[i] = (temp < Tgrid_down[i]) ? ins_R : 1.0;
-
-        auto t_asm = Clock::now();
-        reassemble();
-        auto t_slv = Clock::now();
-        KSPSolve(ksp, b, x_vec);
-        auto t_end = Clock::now();
-
-        PetscScalar R_tot = 0.0;
-        if (mg.levels[0].ctx.r_start == 0) {
-            PetscInt idx = 0; VecGetValues(x_vec, 1, &idx, &R_tot);
+        launch_update_rgrid(mg.levels[0].ctx.d_R, d_Tdown, temp, ins_R, X*Y, false);
+        
+        auto ta=Clock::now(); rebuildCoarseLevelsGPU(mg);
+        
+        for (int lv = 0; lv < mg.nlevels; lv++) {
+            MatAssemblyBegin(mg.levels[lv].mat, MAT_FINAL_ASSEMBLY);
+            MatAssemblyEnd(mg.levels[lv].mat, MAT_FINAL_ASSEMBLY);
         }
-        MPI_Bcast(&R_tot, 1, MPI_DOUBLE, 0, PETSC_COMM_WORLD);
+        KSPSetOperators(ksp, mg.levels[0].mat, mg.levels[0].mat);
+        
+        auto ts=Clock::now(); KSPSolve(ksp,b,x_vec);
+        auto te=Clock::now();
 
-        if (rank == 0) {
-            fprintf(f2, "%f %f\n", temp, PetscRealPart(R_tot));
-            if (save_pics && dn_idx < sched_down.size() &&
-                temp <= sched_down[dn_idx]) {
-                char fn[64]; sprintf(fn, "cool_%d.png", (int)temp);
-                save_rgrid_png(fn, Rgrid.get(), X, Y); dn_idx++;
-            }
-            PetscInt its; KSPGetIterationNumber(ksp, &its);
-            printf("Step %3d (C) | T:%.1f | R:%.4e | "
-                   "Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
-                   step, temp, PetscRealPart(R_tot),
-                   duration<double,std::milli>(t_asm-t_loop_start).count(),
-                   duration<double,std::milli>(t_end-t_slv).count(),
-                   duration<double,std::milli>(t_end-t_loop_start).count(),
-                   (int)its);
+        PetscScalar R_tot=0.0;
+        if (mg.levels[0].ctx.r_start==0) { 
+            const PetscScalar* x_arr;
+            VecGetArrayRead(x_vec, &x_arr);
+            R_tot = x_arr[0];
+            VecRestoreArrayRead(x_vec, &x_arr); 
+        }
+        if (rank==0) {
+            fprintf(f2,"%f %f\n",temp,PetscRealPart(R_tot));
+            PetscInt its; KSPGetIterationNumber(ksp,&its);
+            printf("Step %3d (C) | T:%.1f | R:%.4e | Asm:%.1fms | Slv:%.1fms | Tot:%.1fms | It:%d\n",
+                   step,temp,PetscRealPart(R_tot), duration<double,std::milli>(ta-tl).count(),
+                   duration<double,std::milli>(te-ts).count(), duration<double,std::milli>(te-tl).count(),(int)its);
         }
     }
 
-    // ---- Cleanup ----
-    if (rank == 0) fclose(f2);
+    if (rank==0) { fclose(f1); fclose(f2); }
 
-    for (int lv = 0; lv < mg.nlevels - 1; lv++) {
-        MatDestroy(&mg_setup.R_mats[lv]);
-        MatDestroy(&mg_setup.P_mats[lv]);
-        auto* ig = mg_setup.ig_ctxs[lv];
-        VecScatterDestroy(&ig->fine_scatter);
-        VecScatterDestroy(&ig->coarse_scatter);
-        VecDestroy(&ig->fine_seq);
-        VecDestroy(&ig->coarse_seq);
-        delete ig;
-        mg_setup.ig_ctxs[lv] = nullptr;
-        mg_setup.R_mats[lv]  = nullptr;
-        mg_setup.P_mats[lv]  = nullptr;
-    }
-
-    for (auto& lv : mg.levels) {
-        MatDestroy(&lv.mat);
-        if (lv.ctx.x_ghost) VecDestroy(&lv.ctx.x_ghost);
-    }
+    cuda_free(d_Tup);
+    cuda_free(d_Tdown);
     KSPDestroy(&ksp);
     VecDestroy(&b);
     VecDestroy(&x_vec);
     PetscFinalize();
     return 0;
 }
-
-//fix cmdline:"C:\Program Files (x86)\IntelSWTools\mpi\2019.7.216\intel64\bin\mpiexec.exe" -n 6 ./resgrid -X 500 -Y 500 -ksp_type fgmres -pc_type mg -pc_mg_cycle_type w -mg_levels_ksp_type cg -mg_levels_ksp_max_it 2 -mg_levels_pc_type jacobi -mg_coarse_ksp_type gmres -mg_coarse_ksp_max_it 500 -ksp_gmres_restart 100 -mg_coarse_ksp_rtol 1e-4 -ksp_rtol 1e-6 -ksp_monitor
